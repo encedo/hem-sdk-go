@@ -1,3 +1,15 @@
+// Package hem is a dependency-light Go client for the Encedo HEM (Hardware
+// Encryption Module) REST API. Key material never leaves the device — the SDK
+// only sends challenges and receives signatures, public keys or shared secrets.
+//
+// Binary in, binary out: every parameter and return value that carries key
+// material, plaintext, ciphertext or a MAC is a []byte. Base64 encoding is an
+// implementation detail of the wire format and is handled inside the methods.
+//
+// The optional fields shared by the /api/crypto/* endpoints (alg, ext_kid,
+// pubkey, aad, ctx, iv, tag) are passed as a single CryptoOpts value. Each
+// method documents which fields it honours and rejects the rest, so a field
+// that the endpoint would ignore is reported instead of silently dropped.
 package hem
 
 import (
@@ -12,15 +24,35 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/pbkdf2"
 )
 
-const pbkdf2Iterations = 600_000
+const (
+	pbkdf2Iterations = 600_000
 
-// HemError represents an error returned by the Encedo HSM API.
+	// DefaultBroker is the Encedo notification broker used for checkin and
+	// mobile-push authentication.
+	DefaultBroker = "https://api.encedo.com"
+
+	// DefaultTimeout bounds a single HTTP request to the device.
+	DefaultTimeout = 10 * time.Second
+
+	// maxCryptoMsg is the largest msg the device accepts on /api/crypto/*.
+	maxCryptoMsg = 2048
+
+	// maxCtx is the largest HKDF context the device accepts.
+	maxCtx = 64
+
+	// tokenSkew keeps a cached token from being handed out moments before the
+	// device would reject it as expired.
+	tokenSkew = 5 * time.Second
+)
+
+// HemError represents an error returned by the Encedo HEM API.
 type HemError struct {
 	Message string
 	Code    string
@@ -30,65 +62,168 @@ type HemError struct {
 
 func (e *HemError) Error() string { return e.Message }
 
-// Client is an Encedo HSM API client.
+// Config configures a Client. The zero value is valid: it selects the public
+// broker, a 10 s request timeout, verified TLS and caching enabled.
+type Config struct {
+	// Broker is the notification broker URL. Empty selects DefaultBroker.
+	Broker string
+
+	// Timeout bounds a single HTTP request. Zero selects DefaultTimeout;
+	// a negative value disables the timeout (the caller's context still applies).
+	Timeout time.Duration
+
+	// InsecureSkipVerify disables TLS certificate verification. Needed for a
+	// PPA presenting a self-signed certificate.
+	InsecureSkipVerify bool
+
+	// DisableTokenCache turns off JWT caching entirely.
+	DisableTokenCache bool
+
+	// NoCacheScopes lists scopes whose tokens are never cached. An entry ending
+	// in ':' matches by prefix, so "keymgmt:use:" covers every per-key scope.
+	NoCacheScopes []string
+
+	// DisableKeyCache turns off caching of the X25519 seed derived from the
+	// password. With caching on, AuthPassword(ctx, nil, …) issues further
+	// tokens without the password and without a second PBKDF2 pass; the cost is
+	// that password-equivalent material stays in process memory until
+	// ClearKeys is called. A long-running process should cache the seed for the
+	// startup burst and drop it once the tokens it needs are in hand.
+	DisableKeyCache bool
+
+	// Logf, when set, receives a line per request and response. It is the only
+	// output the SDK produces — nothing is ever written to stdout or stderr.
+	Logf func(format string, v ...interface{})
+}
+
+// Client is an Encedo HEM API client. It is safe for concurrent use.
 type Client struct {
 	baseURL    string
 	broker     string
+	timeout    time.Duration
+	noCache    []string
+	cacheOff   bool
+	keyCache   bool
+	logf       func(format string, v ...interface{})
 	httpClient *http.Client
+
+	mu     sync.Mutex
+	tokens map[string]cachedToken
+	seed   []byte // X25519 seed derived from the password
+	seedID string // device eid the seed was derived for
 }
 
-// NewClient creates a new Encedo HSM client.
-// broker is the notification broker URL (e.g. "https://api.encedo.com").
-// insecureSkipVerify disables TLS certificate verification (use for self-signed PPA certs).
-func NewClient(hsmURL, broker string, insecureSkipVerify bool) *Client {
+type cachedToken struct {
+	jwt string
+	exp time.Time
+}
+
+// NewClient creates a client for the HEM at hsmURL.
+func NewClient(hsmURL string, cfg Config) *Client {
+	broker := cfg.Broker
+	if broker == "" {
+		broker = DefaultBroker
+	}
+	timeout := cfg.Timeout
+	if timeout == 0 {
+		timeout = DefaultTimeout
+	}
+	if timeout < 0 {
+		timeout = 0
+	}
 	return &Client{
-		baseURL: strings.TrimRight(hsmURL, "/"),
-		broker:  strings.TrimRight(broker, "/"),
+		baseURL:  strings.TrimRight(hsmURL, "/"),
+		broker:   strings.TrimRight(broker, "/"),
+		timeout:  timeout,
+		noCache:  append([]string(nil), cfg.NoCacheScopes...),
+		cacheOff: cfg.DisableTokenCache,
+		keyCache: !cfg.DisableKeyCache,
+		logf:     cfg.Logf,
 		httpClient: &http.Client{
 			Transport: &http.Transport{
-				TLSClientConfig:     &tls.Config{InsecureSkipVerify: insecureSkipVerify},
-				DisableKeepAlives:   true,
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: cfg.InsecureSkipVerify},
+				// The embedded device closes the connection after every
+				// response; keep-alive would only produce stale sockets.
+				DisableKeepAlives: true,
 			},
 		},
 	}
 }
 
+func (c *Client) debugf(format string, v ...interface{}) {
+	if c.logf != nil {
+		c.logf(format, v...)
+	}
+}
+
 // req performs an HTTP request and unmarshals the JSON response into out.
-// Mirrors #req() in hem-sdk.js.
-func (c *Client) req(method, url string, body interface{}, token string, out interface{}) error {
+func (c *Client) req(ctx context.Context, method, url string, body interface{}, token string, out interface{}) error {
+	_, err := c.do(ctx, method, url, body, token, out)
+	return err
+}
+
+// do is req plus the HTTP status code, which the broker polling loop needs:
+// an unanswered request comes back as 202, a success code that nonetheless
+// means "keep waiting".
+func (c *Client) do(ctx context.Context, method, url string, body interface{}, token string, out interface{}) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if c.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.timeout)
+		defer cancel()
+	}
+
 	var bodyReader io.Reader
+	var bodyLen int
 	if body != nil {
 		data, err := json.Marshal(body)
 		if err != nil {
-			return &HemError{Message: fmt.Sprintf("marshal request body: %v", err), Code: "encode_error"}
+			return 0, &HemError{Message: fmt.Sprintf("marshal request body: %v", err), Code: "encode_error"}
 		}
 		bodyReader = bytes.NewReader(data)
+		bodyLen = len(data)
 	}
 
-	req, err := http.NewRequest(method, url, bodyReader)
+	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
 	if err != nil {
-		return &HemError{Message: fmt.Sprintf("create request: %v", err), Code: "request_error"}
+		return 0, &HemError{Message: fmt.Sprintf("create request: %v", err), Code: "request_error"}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
+	// The embedded HTTP server rejects chunked bodies with 411; an explicit
+	// length is required even when the body is empty.
+	if bodyReader != nil {
+		req.ContentLength = int64(bodyLen)
+	}
+	c.debugf("HEM -> %s %s (%d B)", method, url, bodyLen)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return &HemError{Message: fmt.Sprintf("network error: %v", err), Code: "network"}
+		code := "network"
+		switch ctx.Err() {
+		case context.DeadlineExceeded:
+			code = "timeout"
+		case context.Canceled:
+			code = "aborted"
+		}
+		return 0, &HemError{Message: fmt.Sprintf("%s %s: %v", method, url, err), Code: code}
 	}
 	defer resp.Body.Close()
 
 	respData, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return &HemError{Message: fmt.Sprintf("read response: %v", err), Code: "read_error"}
+		return resp.StatusCode, &HemError{Message: fmt.Sprintf("read response: %v", err), Code: "read_error"}
 	}
+	c.debugf("HEM <- %d (%d B)", resp.StatusCode, len(respData))
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var data interface{}
 		_ = json.Unmarshal(respData, &data)
-		return &HemError{
+		return resp.StatusCode, &HemError{
 			Message: fmt.Sprintf("HEM %s %s -> HTTP %d", method, url, resp.StatusCode),
 			Code:    fmt.Sprintf("http_%d", resp.StatusCode),
 			Status:  resp.StatusCode,
@@ -96,29 +231,115 @@ func (c *Client) req(method, url string, body interface{}, token string, out int
 		}
 	}
 
-	if out != nil {
+	// A 2xx with no body is a valid answer for the endpoints that only signal
+	// success (hmac/verify, key update); decoding it would fail on EOF.
+	if out != nil && len(respData) > 0 {
 		dec := json.NewDecoder(bytes.NewReader(respData))
 		dec.UseNumber()
 		if err := dec.Decode(out); err != nil {
-			return &HemError{Message: fmt.Sprintf("unmarshal response: %v", err), Code: "decode_error"}
+			return resp.StatusCode, &HemError{Message: fmt.Sprintf("unmarshal response: %v", err), Code: "decode_error"}
 		}
 	}
-	return nil
+	return resp.StatusCode, nil
 }
 
-// Checkin performs the 3-step HSM clock synchronisation.
-// Mirrors hemCheckin() in hem-sdk.js.
-func (c *Client) Checkin() error {
+// -- Token and key cache -----------------------------------------------------
+
+func (c *Client) cacheable(scope string) bool {
+	if c.cacheOff {
+		return false
+	}
+	for _, s := range c.noCache {
+		if s == scope || (strings.HasSuffix(s, ":") && strings.HasPrefix(scope, s)) {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *Client) cacheFind(scope string) (string, bool) {
+	if !c.cacheable(scope) {
+		return "", false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	for s, t := range c.tokens {
+		if !t.exp.IsZero() && now.After(t.exp.Add(-tokenSkew)) {
+			delete(c.tokens, s)
+		}
+	}
+	t, ok := c.tokens[scope]
+	if !ok {
+		return "", false
+	}
+	return t.jwt, true
+}
+
+func (c *Client) cacheStore(scope, jwt string) {
+	if !c.cacheable(scope) {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.tokens == nil {
+		c.tokens = make(map[string]cachedToken)
+	}
+	c.tokens[scope] = cachedToken{jwt: jwt, exp: jwtExp(jwt)}
+}
+
+// ClearCache drops every cached JWT. The derived key, if any, is kept.
+func (c *Client) ClearCache() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.tokens = nil
+}
+
+// ClearKeys drops the cached derived key and every cached JWT. Call it on
+// logout, or once a long-running process holds the tokens it needs.
+func (c *Client) ClearKeys() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.tokens = nil
+	zeroBytes(c.seed)
+	c.seed = nil
+	c.seedID = ""
+}
+
+// jwtExp returns the exp claim of a JWT, or the zero time if it has none.
+func jwtExp(token string) time.Time {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return time.Time{}
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return time.Time{}
+	}
+	var claims struct {
+		Exp int64 `json:"exp"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil || claims.Exp == 0 {
+		return time.Time{}
+	}
+	return time.Unix(claims.Exp, 0)
+}
+
+// -- Checkin -----------------------------------------------------------------
+
+// Checkin performs the 3-step clock synchronisation between the device and the
+// Encedo backend. Call it once, before anything else. No authorization needed.
+func (c *Client) Checkin(ctx context.Context) error {
 	var step1 map[string]interface{}
-	if err := c.req("GET", c.baseURL+"/api/system/checkin", nil, "", &step1); err != nil {
+	if err := c.req(ctx, "GET", c.baseURL+"/api/system/checkin", nil, "", &step1); err != nil {
 		return err
 	}
 	if _, ok := step1["check"]; !ok {
-		return &HemError{Message: "HSM checkin failed (no check field)", Code: "checkin_error"}
+		return &HemError{Message: "HEM checkin failed (no check field)", Code: "checkin_error"}
 	}
 
 	var step2 map[string]interface{}
-	if err := c.req("POST", c.broker+"/checkin", step1, "", &step2); err != nil {
+	if err := c.req(ctx, "POST", c.broker+"/checkin", step1, "", &step2); err != nil {
 		return err
 	}
 	if _, ok := step2["checked"]; !ok {
@@ -126,14 +347,16 @@ func (c *Client) Checkin() error {
 	}
 
 	var step3 map[string]interface{}
-	if err := c.req("POST", c.baseURL+"/api/system/checkin", step2, "", &step3); err != nil {
+	if err := c.req(ctx, "POST", c.baseURL+"/api/system/checkin", step2, "", &step3); err != nil {
 		return err
 	}
 	if _, ok := step3["status"]; !ok {
-		return &HemError{Message: "HSM checkin step 3 failed (no status field)", Code: "checkin_error"}
+		return &HemError{Message: "HEM checkin step 3 failed (no status field)", Code: "checkin_error"}
 	}
 	return nil
 }
+
+// -- Authentication ----------------------------------------------------------
 
 // zeroBytes overwrites a byte slice with zeros to remove sensitive data from memory.
 func zeroBytes(b []byte) {
@@ -142,9 +365,8 @@ func zeroBytes(b []byte) {
 	}
 }
 
-// deriveX25519 runs PBKDF2-SHA256 on password with salt=eid and returns
-// the seed and the derived X25519 public key in standard base64.
-// Mirrors #deriveX25519() in hem-sdk.js.
+// deriveX25519 runs PBKDF2-SHA256 over password with salt=eid and returns the
+// seed together with the derived X25519 public key in standard base64.
 func deriveX25519(password []byte, eid string) (seed []byte, pubKeyB64 string, err error) {
 	seed = pbkdf2.Key(password, []byte(eid), pbkdf2Iterations, 32, sha256.New)
 	pubKeyBytes, err := curve25519.X25519(seed, curve25519.Basepoint)
@@ -158,7 +380,6 @@ func deriveX25519(password []byte, eid string) (seed []byte, pubKeyB64 string, e
 // buildEjwt constructs the eJWT used for password authentication.
 // Header: {"ecdh":"x25519","alg":"HS256","typ":"JWT"}
 // Signature: HMAC-SHA256(header.payload, X25519(seed, devicePubKey))
-// Mirrors #buildEjwt() in hem-sdk.js.
 func buildEjwt(seed []byte, devicePubKeyB64 string, payload map[string]interface{}) (string, error) {
 	hdrJSON, err := json.Marshal(map[string]string{"ecdh": "x25519", "alg": "HS256", "typ": "JWT"})
 	if err != nil {
@@ -190,9 +411,21 @@ func buildEjwt(seed []byte, devicePubKeyB64 string, payload map[string]interface
 	return input + "." + sig, nil
 }
 
-// AuthPassword authenticates with a local password and returns a JWT token.
-// Mirrors authorizePassword() in hem-sdk.js.
-func (c *Client) AuthPassword(password []byte, scope string, expSeconds int) (string, error) {
+// AuthPassword authenticates with the local password and returns a scoped JWT.
+//
+// Pass password=nil to reuse the key derived by an earlier call — the second
+// and further scopes then need neither the password nor another PBKDF2 pass.
+// This requires Config.DisableKeyCache to be false (the default) and an earlier
+// successful call against the same device; otherwise it fails with code
+// "auth_password_required".
+//
+// The caller owns password and is responsible for zeroing it; the SDK does not,
+// precisely so that it can be passed to several AuthPassword calls in a row.
+func (c *Client) AuthPassword(ctx context.Context, password []byte, scope string, expSeconds int) (string, error) {
+	if jwt, ok := c.cacheFind(scope); ok {
+		return jwt, nil
+	}
+
 	var challenge struct {
 		EID string `json:"eid"`
 		SPK string `json:"spk"`
@@ -200,14 +433,15 @@ func (c *Client) AuthPassword(password []byte, scope string, expSeconds int) (st
 		Exp int64  `json:"exp"`
 		Lbl string `json:"lbl"`
 	}
-	if err := c.req("GET", c.baseURL+"/api/auth/token", nil, "", &challenge); err != nil {
+	if err := c.req(ctx, "GET", c.baseURL+"/api/auth/token", nil, "", &challenge); err != nil {
 		return "", err
 	}
 
-	seed, pubKeyB64, err := deriveX25519(password, challenge.EID)
+	seed, pubKeyB64, err := c.seedFor(password, challenge.EID)
 	if err != nil {
 		return "", err
 	}
+	defer zeroBytes(seed)
 
 	iat := time.Now().Unix() - 5
 	payload := map[string]interface{}{
@@ -220,7 +454,6 @@ func (c *Client) AuthPassword(password []byte, scope string, expSeconds int) (st
 	}
 
 	ejwt, err := buildEjwt(seed, challenge.SPK, payload)
-	zeroBytes(seed) // seed no longer needed — token is derived, only ejwt matters now
 	if err != nil {
 		return "", err
 	}
@@ -228,83 +461,131 @@ func (c *Client) AuthPassword(password []byte, scope string, expSeconds int) (st
 	var resp struct {
 		Token string `json:"token"`
 	}
-	if err := c.req("POST", c.baseURL+"/api/auth/token", map[string]string{"auth": ejwt}, "", &resp); err != nil {
+	if err := c.req(ctx, "POST", c.baseURL+"/api/auth/token", map[string]string{"auth": ejwt}, "", &resp); err != nil {
 		return "", err
 	}
 	if resp.Token == "" {
 		return "", &HemError{Message: "no token in auth response", Code: "auth_failed"}
 	}
+	c.cacheStore(scope, resp.Token)
 	return resp.Token, nil
 }
 
-// AuthRemote authenticates via mobile push notification (broker polling).
-// Mirrors authorizeRemote() in hem-sdk.js.
-// If ctx is cancelled, returns ctx.Err() — caller should fall back to password auth.
-func (c *Client) AuthRemote(ctx context.Context, scope string, pollInterval, pollTimeout time.Duration) (string, error) {
+// seedFor returns a private copy of the X25519 seed for the given device eid,
+// deriving it from the password when there is nothing usable in the cache.
+// The copy is what makes ClearKeys safe to call while a request is in flight:
+// it wipes the cached seed without touching the one the request is signing with.
+func (c *Client) seedFor(password []byte, eid string) (seed []byte, pubKeyB64 string, err error) {
+	if c.keyCache {
+		c.mu.Lock()
+		var cached []byte
+		if c.seed != nil && c.seedID == eid {
+			cached = append([]byte(nil), c.seed...)
+		}
+		c.mu.Unlock()
+		if cached != nil {
+			pub, err := curve25519.X25519(cached, curve25519.Basepoint)
+			if err != nil {
+				zeroBytes(cached)
+				return nil, "", fmt.Errorf("X25519 public key derivation: %w", err)
+			}
+			return cached, base64.StdEncoding.EncodeToString(pub), nil
+		}
+	}
+	if password == nil {
+		return nil, "", &HemError{
+			Message: "no cached key for this device — a password is required",
+			Code:    "auth_password_required",
+		}
+	}
+
+	seed, pubKeyB64, err = deriveX25519(password, eid)
+	if err != nil {
+		return nil, "", err
+	}
+	if c.keyCache {
+		c.mu.Lock()
+		zeroBytes(c.seed)
+		c.seed, c.seedID = append([]byte(nil), seed...), eid
+		c.mu.Unlock()
+	}
+	return seed, pubKeyB64, nil
+}
+
+// RemoteOpts tunes the mobile-push authentication flow.
+type RemoteOpts struct {
+	// PollInterval is the delay between broker polls. Zero selects 2 s.
+	PollInterval time.Duration
+	// PollTimeout gives up on an unanswered request. Zero selects 60 s.
+	PollTimeout time.Duration
+	// OnPending, when set, is called before every poll. The SDK writes nothing
+	// itself — this is where a CLI prints "waiting for confirmation".
+	OnPending func()
+}
+
+// AuthRemote authenticates via a mobile push notification and returns a scoped
+// JWT. The user approves the request in the Encedo authenticator app.
+// Cancelling ctx aborts the wait and returns ctx.Err().
+func (c *Client) AuthRemote(ctx context.Context, scope string, opts RemoteOpts) (string, error) {
+	if jwt, ok := c.cacheFind(scope); ok {
+		return jwt, nil
+	}
+	pollInterval := opts.PollInterval
+	if pollInterval <= 0 {
+		pollInterval = 2 * time.Second
+	}
+	pollTimeout := opts.PollTimeout
+	if pollTimeout <= 0 {
+		pollTimeout = 60 * time.Second
+	}
+
 	// Step 1: broker session
 	var session map[string]interface{}
-	if err := c.req("GET", c.broker+"/notify/session", nil, "", &session); err != nil {
+	if err := c.req(ctx, "GET", c.broker+"/notify/session", nil, "", &session); err != nil {
 		return "", err
 	}
 
-	// Step 2: request auth from device (pass full session data + scope)
+	// Step 2: request auth from the device (full session data + scope)
 	session["scope"] = scope
 	var challenge map[string]interface{}
-	if err := c.req("POST", c.baseURL+"/api/auth/ext/request", session, "", &challenge); err != nil {
+	if err := c.req(ctx, "POST", c.baseURL+"/api/auth/ext/request", session, "", &challenge); err != nil {
 		return "", err
 	}
 
-	// Step 3: forward challenge to broker
+	// Step 3: forward the challenge to the broker
 	var event struct {
 		EventID string `json:"eventid"`
 	}
-	if err := c.req("POST", c.broker+"/notify/event/new", challenge, "", &event); err != nil {
+	if err := c.req(ctx, "POST", c.broker+"/notify/event/new", challenge, "", &event); err != nil {
 		return "", err
 	}
 	if event.EventID == "" {
 		return "", &HemError{Message: "no eventid from broker", Code: "broker_error"}
 	}
 
-	// Step 4: poll
+	// Step 4: poll until the user approves, denies, or the deadline passes
 	deadline := time.Now().Add(pollTimeout)
 	var result map[string]interface{}
 
 	for time.Now().Before(deadline) {
+		if opts.OnPending != nil {
+			opts.OnPending()
+		}
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
 		case <-time.After(pollInterval):
 		}
 
-		pollReq, err := http.NewRequestWithContext(ctx, "GET",
-			c.broker+"/notify/event/check/"+event.EventID, nil)
+		var polled map[string]interface{}
+		status, err := c.do(ctx, "GET", c.broker+"/notify/event/check/"+event.EventID, nil, "", &polled)
 		if err != nil {
-			return "", &HemError{Message: fmt.Sprintf("create poll request: %v", err), Code: "request_error"}
+			return "", err
 		}
-
-		pollResp, err := c.httpClient.Do(pollReq)
-		if err != nil {
-			return "", &HemError{Message: fmt.Sprintf("broker poll network error: %v", err), Code: "network"}
+		if status == http.StatusAccepted {
+			continue // the user has not answered yet
 		}
-
-		if pollResp.StatusCode == 202 {
-			pollResp.Body.Close()
-			continue
-		}
-		if pollResp.StatusCode != 200 {
-			pollResp.Body.Close()
-			return "", &HemError{
-				Message: fmt.Sprintf("broker poll HTTP %d", pollResp.StatusCode),
-				Code:    fmt.Sprintf("http_%d", pollResp.StatusCode),
-				Status:  pollResp.StatusCode,
-			}
-		}
-
-		if err := json.NewDecoder(pollResp.Body).Decode(&result); err != nil {
-			pollResp.Body.Close()
-			return "", &HemError{Message: fmt.Sprintf("decode poll result: %v", err), Code: "decode_error"}
-		}
-		pollResp.Body.Close()
+		result = polled
 		break
 	}
 
@@ -312,7 +593,6 @@ func (c *Client) AuthRemote(ctx context.Context, scope string, pollInterval, pol
 		return "", &HemError{Message: "remote auth timed out", Code: "timeout"}
 	}
 
-	// Step 5a: check denial
 	if deny, _ := result["deny"].(bool); deny {
 		return "", &HemError{Message: "auth denied by user", Code: "denied"}
 	}
@@ -321,19 +601,21 @@ func (c *Client) AuthRemote(ctx context.Context, scope string, pollInterval, pol
 		return "", &HemError{Message: "missing authreply", Code: "broker_error"}
 	}
 
-	// Step 5b: exchange authreply for JWT
 	var tokenResp struct {
 		Token string `json:"token"`
 	}
-	if err := c.req("POST", c.baseURL+"/api/auth/ext/token",
+	if err := c.req(ctx, "POST", c.baseURL+"/api/auth/ext/token",
 		map[string]string{"authreply": authreply}, "", &tokenResp); err != nil {
 		return "", err
 	}
 	if tokenResp.Token == "" {
 		return "", &HemError{Message: "no token in ext/token response", Code: "auth_failed"}
 	}
+	c.cacheStore(scope, tokenResp.Token)
 	return tokenResp.Token, nil
 }
+
+// -- Key management ----------------------------------------------------------
 
 // KeyEntry represents a single key entry returned by ListKeys and SearchKeys.
 type KeyEntry struct {
@@ -345,8 +627,9 @@ type KeyEntry struct {
 	Descr   []byte // raw binary, nil if not set
 }
 
-// listResp is the shared response shape for list/search endpoints.
+// listResp is the shared response shape for the list and search endpoints.
 type listResp struct {
+	Offset int `json:"offset"`
 	Total  int `json:"total"`
 	Listed int `json:"listed"`
 	List   []struct {
@@ -355,7 +638,7 @@ type listResp struct {
 		Type    string `json:"type"`
 		Created int64  `json:"created"`
 		Updated int64  `json:"updated"`
-		Descr   string `json:"descr"` // base64-encoded by HEM API; decoded to []byte in KeyEntry
+		Descr   string `json:"descr"` // base64-encoded by the HEM API
 	} `json:"list"`
 }
 
@@ -374,51 +657,54 @@ func parseKeyList(resp listResp) []KeyEntry {
 	return entries
 }
 
-// ListKeys returns a paginated list of keys from the HSM repository.
+// ListKeys returns a page of the key repository.
 // Scope: keymgmt:list
-func (c *Client) ListKeys(token string, offset, limit int) (total int, keys []KeyEntry, err error) {
+func (c *Client) ListKeys(ctx context.Context, token string, offset, limit int) (total int, keys []KeyEntry, err error) {
 	var resp listResp
 	url := fmt.Sprintf("%s/api/keymgmt/list/%d/%d", c.baseURL, offset, limit)
-	if err := c.req("GET", url, nil, token, &resp); err != nil {
+	if err := c.req(ctx, "GET", url, nil, token, &resp); err != nil {
 		return 0, nil, err
 	}
 	return resp.Total, parseKeyList(resp), nil
 }
 
-// SearchKeys searches the HSM key repository by the descr field.
-// pattern is raw binary matched against the binary descr stored in the HSM.
-// Prefix '^' or suffix '$' anchoring is applied to the base64-encoded pattern,
-// not to the raw bytes (HEM API convention).
-// Pass token="" for anonymous access when allow_keysearch is enabled on the device
-// and len(pattern) >= 6 bytes.
-// Scope: keymgmt:search (token optional if allow_keysearch device config is set)
+// SearchKeys returns the keys whose descr field starts with pattern.
 //
-// TODO: suffix match — HEM API likely supports <base64>$ (ends-with), but this
-// is not documented in the PHP SDK and needs verification against FW source.
-func (c *Client) SearchKeys(token string, pattern []byte, prefixMatch bool, offset, limit int) (total int, keys []KeyEntry, err error) {
-	encoded := base64.StdEncoding.EncodeToString(pattern)
-	if prefixMatch {
-		encoded = "^" + encoded
+// pattern is raw binary; the '^' anchor the device expects is applied to the
+// base64 form, not to the bytes. Only prefix matching is available — a suffix
+// anchor ('$') is neither documented nor exercised by the certification test
+// suite, so it is left out until the firmware behaviour is confirmed.
+//
+// limit <= 0 leaves the device default (15 entries) in place. Paginate by
+// adding len(keys) to offset until offset reaches total.
+//
+// Pass token="" for anonymous access, which the device permits when
+// allow_keysearch is configured and pattern is at least 6 bytes long.
+// Scope: keymgmt:search (or keymgmt:list + auth:ext:pair)
+func (c *Client) SearchKeys(ctx context.Context, token string, pattern []byte, offset, limit int) (total int, keys []KeyEntry, err error) {
+	if offset < 0 {
+		offset = 0
 	}
 	body := map[string]interface{}{
-		"descr":  encoded,
+		"descr":  "^" + base64.StdEncoding.EncodeToString(pattern),
 		"offset": offset,
-		"limit":  limit,
+	}
+	if limit > 0 {
+		body["limit"] = limit
 	}
 	var resp listResp
-	if err := c.req("POST", c.baseURL+"/api/keymgmt/search", body, token, &resp); err != nil {
+	if err := c.req(ctx, "POST", c.baseURL+"/api/keymgmt/search", body, token, &resp); err != nil {
 		return 0, nil, err
 	}
 	return resp.Total, parseKeyList(resp), nil
 }
 
-// CreateKey generates a new key in the HSM repository.
-// keyType: CURVE25519, ED25519, AES256, etc.
-// mode: optional key mode for NIST ECC keys ("ECDH", "ExDSA", "ECDH,ExDSA"); pass "" to omit.
-// descr: optional raw binary description (up to 128 bytes); pass nil to omit.
-// Returns the KID (32-char hex) of the created key.
+// CreateKey generates a new key in the repository and returns its KID.
+// keyType is CURVE25519, ED25519, AES256, … ; mode is the usage mode required
+// by NIST ECC keys ("ECDH", "ExDSA", "ECDH,ExDSA") and may be empty.
+// descr is raw binary, up to 128 bytes, and may be nil.
 // Scope: keymgmt:gen
-func (c *Client) CreateKey(token, label, keyType string, descr []byte, mode string) (kid string, err error) {
+func (c *Client) CreateKey(ctx context.Context, token, label, keyType string, descr []byte, mode string) (kid string, err error) {
 	body := map[string]interface{}{
 		"label": label,
 		"type":  keyType,
@@ -432,7 +718,7 @@ func (c *Client) CreateKey(token, label, keyType string, descr []byte, mode stri
 	var resp struct {
 		KID string `json:"kid"`
 	}
-	if err := c.req("POST", c.baseURL+"/api/keymgmt/create", body, token, &resp); err != nil {
+	if err := c.req(ctx, "POST", c.baseURL+"/api/keymgmt/create", body, token, &resp); err != nil {
 		return "", err
 	}
 	if resp.KID == "" {
@@ -441,14 +727,11 @@ func (c *Client) CreateKey(token, label, keyType string, descr []byte, mode stri
 	return resp.KID, nil
 }
 
-// ImportKey imports an external public key into the HSM repository.
-// Supported types: CURVE25519, ED25519, SECP256R1, MLKEM512, etc.
-// pubkey: raw binary public key bytes.
-// descr: optional raw binary description (up to 128 bytes); pass nil to omit.
-// mode: optional key mode for NIST ECC keys; pass "" to omit.
-// Returns the KID (32-char hex) of the imported key.
+// ImportKey imports an external public key and returns its KID.
+// pubkey is raw binary — for NIST ECC keys a compressed SEC1 point (0x02/0x03||X),
+// which also requires mode to be set.
 // Scope: keymgmt:imp
-func (c *Client) ImportKey(token, label, keyType string, pubkey, descr []byte, mode string) (kid string, err error) {
+func (c *Client) ImportKey(ctx context.Context, token, label, keyType string, pubkey, descr []byte, mode string) (kid string, err error) {
 	body := map[string]interface{}{
 		"label":  label,
 		"type":   keyType,
@@ -463,7 +746,7 @@ func (c *Client) ImportKey(token, label, keyType string, pubkey, descr []byte, m
 	var resp struct {
 		KID string `json:"kid"`
 	}
-	if err := c.req("POST", c.baseURL+"/api/keymgmt/import", body, token, &resp); err != nil {
+	if err := c.req(ctx, "POST", c.baseURL+"/api/keymgmt/import", body, token, &resp); err != nil {
 		return "", err
 	}
 	if resp.KID == "" {
@@ -472,12 +755,11 @@ func (c *Client) ImportKey(token, label, keyType string, pubkey, descr []byte, m
 	return resp.KID, nil
 }
 
-// UpdateKey updates a key's label and/or description in the HSM repository.
-// At least one of label or descr must be provided; returns an error otherwise.
-// Pass label="" to leave the label unchanged.
-// Pass descr=nil to leave the description unchanged.
+// UpdateKey updates a key's label and/or description.
+// An empty label leaves the label unchanged; a nil descr leaves the description
+// unchanged. At least one of the two must be set.
 // Scope: keymgmt:upd
-func (c *Client) UpdateKey(token, kid, label string, descr []byte) error {
+func (c *Client) UpdateKey(ctx context.Context, token, kid, label string, descr []byte) error {
 	if label == "" && descr == nil {
 		return &HemError{Message: "UpdateKey: label or descr must be set", Code: "invalid_arg"}
 	}
@@ -488,158 +770,442 @@ func (c *Client) UpdateKey(token, kid, label string, descr []byte) error {
 	if descr != nil {
 		body["descr"] = base64.StdEncoding.EncodeToString(descr)
 	}
-	return c.req("POST", c.baseURL+"/api/keymgmt/update", body, token, nil)
+	return c.req(ctx, "POST", c.baseURL+"/api/keymgmt/update", body, token, nil)
 }
 
-// CipherEncryptResult holds the output of a CipherEncrypt call.
-type CipherEncryptResult struct {
-	Ciphertext []byte // raw binary
-	IV         []byte // raw binary (12B for GCM)
-	Tag        []byte // raw binary (16B for GCM), nil for non-GCM modes
+// DeleteKey removes a key from the repository. The operation is irreversible:
+// a private key deleted here cannot be recovered from anywhere else.
+// Scope: keymgmt:del
+func (c *Client) DeleteKey(ctx context.Context, token, kid string) error {
+	return c.req(ctx, "DELETE", c.baseURL+"/api/keymgmt/delete/"+kid, nil, token, nil)
 }
 
-// CipherEncrypt encrypts data using a key stored in the HSM.
-// alg: "AES256-GCM", "AES128-GCM", "AES256-CBC", etc.
-// extKid: KID of a peer CURVE25519 key for ECDH-based encryption; takes priority over pubkey.
-// pubkey: peer's raw X25519 public key for ECDH-based encryption; used when extKid is empty.
-// aad: additional authenticated data for GCM modes (raw binary); pass nil to omit.
-// ctx: context field (raw binary); pass nil to omit.
-// The IV is generated by the HSM (12B for AES-GCM).
+// PubKeyInfo is the public half of a key stored in the HEM.
+type PubKeyInfo struct {
+	PubKey  []byte // raw binary
+	Type    string
+	Updated int64
+}
+
+// GetPubKey retrieves the public key and metadata for a key ID.
 // Scope: keymgmt:use:<KID>
-func (c *Client) CipherEncrypt(token, kid, alg, extKid string, plaintext, pubkey, aad, ctx []byte) (*CipherEncryptResult, error) {
-	if extKid != "" && len(pubkey) > 0 {
-		return nil, &HemError{Message: "CipherEncrypt: provide ext_kid or pubkey, not both", Code: "invalid_arg"}
+func (c *Client) GetPubKey(ctx context.Context, token, kid string) (PubKeyInfo, error) {
+	var resp struct {
+		PubKey  string `json:"pubkey"`
+		Type    string `json:"type"`
+		Updated int64  `json:"updated"`
+	}
+	if err := c.req(ctx, "GET", c.baseURL+"/api/keymgmt/get/"+kid, nil, token, &resp); err != nil {
+		return PubKeyInfo{}, err
+	}
+	raw, err := base64.StdEncoding.DecodeString(resp.PubKey)
+	if err != nil {
+		return PubKeyInfo{}, &HemError{Message: fmt.Sprintf("decode pubkey: %v", err), Code: "decode_error"}
+	}
+	return PubKeyInfo{PubKey: raw, Type: resp.Type, Updated: resp.Updated}, nil
+}
+
+// -- Cryptography ------------------------------------------------------------
+
+// CryptoOpts carries the optional fields shared by the /api/crypto/* endpoints.
+// The zero value uses the key at kid directly and lets the device pick its
+// default algorithm.
+//
+// ExtKID and PubKey both name a peer public key, which turns the operation into
+// an indirect one: the device runs ECDH between kid and the peer key and uses
+// the shared secret as the operation's key. The peer key must be of the same
+// type as kid. Naming kid's own public key is legal and yields a self-ECDH key
+// that exists only inside the device.
+//
+// Each method rejects the fields its endpoint does not accept, so an option
+// that would be ignored on the wire is reported as "invalid_arg" instead.
+type CryptoOpts struct {
+	Alg    string // ECDH: hash over the shared secret, "" for raw. HMAC: SHA2-256/384/512, SHA3-256/384/512. Cipher: AES256-GCM, AES256-CBC, … Wrap: AES128/AES192/AES256
+	ExtKID string // peer public key already stored in the HEM
+	PubKey []byte // raw peer public key; must not be combined with ExtKID
+	AAD    []byte // cipher encrypt/decrypt, GCM modes only
+	Ctx    []byte // HKDF context, max 64 bytes — cipher and wrap/unwrap
+	IV     []byte // explicit IV — cipher decrypt and wrap/unwrap
+	Tag    []byte // GCM authentication tag — cipher decrypt only
+}
+
+// applyPeer writes the ext_kid/pubkey selector into body.
+func (o CryptoOpts) applyPeer(body map[string]interface{}) error {
+	if o.ExtKID != "" && len(o.PubKey) > 0 {
+		return &HemError{Message: "set ExtKID or PubKey, not both", Code: "invalid_arg"}
+	}
+	if o.ExtKID != "" {
+		body["ext_kid"] = o.ExtKID
+	} else if len(o.PubKey) > 0 {
+		body["pubkey"] = base64.StdEncoding.EncodeToString(o.PubKey)
+	}
+	return nil
+}
+
+// reject reports the options set by the caller that the endpoint does not accept.
+func (o CryptoOpts) reject(op string, allowed ...string) error {
+	ok := func(name string) bool {
+		for _, a := range allowed {
+			if a == name {
+				return true
+			}
+		}
+		return false
+	}
+	var bad []string
+	if o.Alg != "" && !ok("alg") {
+		bad = append(bad, "Alg")
+	}
+	if len(o.AAD) > 0 && !ok("aad") {
+		bad = append(bad, "AAD")
+	}
+	if len(o.Ctx) > 0 && !ok("ctx") {
+		bad = append(bad, "Ctx")
+	}
+	if len(o.IV) > 0 && !ok("iv") {
+		bad = append(bad, "IV")
+	}
+	if len(o.Tag) > 0 && !ok("tag") {
+		bad = append(bad, "Tag")
+	}
+	if len(bad) > 0 {
+		return &HemError{
+			Message: fmt.Sprintf("%s does not accept %s", op, strings.Join(bad, ", ")),
+			Code:    "invalid_arg",
+		}
+	}
+	if len(o.Ctx) > maxCtx {
+		return &HemError{
+			Message: fmt.Sprintf("%s: ctx is %d bytes, max %d", op, len(o.Ctx), maxCtx),
+			Code:    "invalid_arg",
+		}
+	}
+	return nil
+}
+
+// checkMsgSize guards the device's 2048-byte limit on /api/crypto/* payloads,
+// which otherwise surfaces as an opaque HTTP 400.
+func checkMsgSize(op string, msg []byte) error {
+	if len(msg) > maxCryptoMsg {
+		return &HemError{
+			Message: fmt.Sprintf("%s: message is %d bytes, max %d", op, len(msg), maxCryptoMsg),
+			Code:    "invalid_arg",
+		}
+	}
+	return nil
+}
+
+// ECDH runs a Curve25519 (or NIST ECC) ECDH on the device and returns the
+// shared secret. Set opts.PubKey for a peer key held in software, opts.ExtKID
+// for one already imported into the HEM — the latter keeps both operands inside
+// the device. opts.Alg hashes the result; leave it empty for the raw secret,
+// which is what the WireGuard Noise handshake needs.
+// Honours: Alg, ExtKID, PubKey. Scope: keymgmt:use:<KID>
+func (c *Client) ECDH(ctx context.Context, token, kid string, opts CryptoOpts) ([]byte, error) {
+	if err := opts.reject("ECDH", "alg"); err != nil {
+		return nil, err
+	}
+	body := map[string]interface{}{"kid": kid}
+	if err := opts.applyPeer(body); err != nil {
+		return nil, err
+	}
+	if opts.Alg != "" {
+		body["alg"] = opts.Alg
+	}
+	var resp struct {
+		ECDH string `json:"ecdh"`
+	}
+	if err := c.req(ctx, "POST", c.baseURL+"/api/crypto/ecdh", body, token, &resp); err != nil {
+		return nil, err
+	}
+	if resp.ECDH == "" {
+		return nil, &HemError{Message: "no ecdh in response", Code: "ecdh_error"}
+	}
+	raw, err := base64.StdEncoding.DecodeString(resp.ECDH)
+	if err != nil {
+		return nil, &HemError{Message: fmt.Sprintf("decode ECDH result: %v", err), Code: "decode_error"}
+	}
+	return raw, nil
+}
+
+// HmacHash computes an HMAC over msg (max 2048 bytes) with a key in the HEM.
+// With opts.ExtKID or opts.PubKey the MAC key is the ECDH shared secret rather
+// than the key at kid, so pointing at kid's own public key produces a MAC key
+// that never exists outside the device.
+// Honours: Alg, ExtKID, PubKey. Scope: keymgmt:use:<KID>
+func (c *Client) HmacHash(ctx context.Context, token, kid string, msg []byte, opts CryptoOpts) ([]byte, error) {
+	if err := opts.reject("HmacHash", "alg"); err != nil {
+		return nil, err
+	}
+	if err := checkMsgSize("HmacHash", msg); err != nil {
+		return nil, err
 	}
 	body := map[string]interface{}{
 		"kid": kid,
-		"alg": alg,
+		"msg": base64.StdEncoding.EncodeToString(msg),
+	}
+	if err := opts.applyPeer(body); err != nil {
+		return nil, err
+	}
+	if opts.Alg != "" {
+		body["alg"] = opts.Alg
+	}
+	var resp struct {
+		MAC string `json:"mac"`
+	}
+	if err := c.req(ctx, "POST", c.baseURL+"/api/crypto/hmac/hash", body, token, &resp); err != nil {
+		return nil, err
+	}
+	if resp.MAC == "" {
+		return nil, &HemError{Message: "no mac in hmac/hash response", Code: "hmac_error"}
+	}
+	raw, err := base64.StdEncoding.DecodeString(resp.MAC)
+	if err != nil {
+		return nil, &HemError{Message: fmt.Sprintf("decode mac: %v", err), Code: "decode_error"}
+	}
+	return raw, nil
+}
+
+// HmacVerify checks a MAC on the device. It returns nil when the MAC is valid
+// and a *HemError otherwise — the comparison happens inside the HEM, so a
+// caller never has to write a constant-time compare of its own.
+// opts must match the HmacHash call that produced the MAC.
+// Honours: Alg, ExtKID, PubKey. Scope: keymgmt:use:<KID>
+func (c *Client) HmacVerify(ctx context.Context, token, kid string, msg, mac []byte, opts CryptoOpts) error {
+	if err := opts.reject("HmacVerify", "alg"); err != nil {
+		return err
+	}
+	if err := checkMsgSize("HmacVerify", msg); err != nil {
+		return err
+	}
+	body := map[string]interface{}{
+		"kid": kid,
+		"msg": base64.StdEncoding.EncodeToString(msg),
+		"mac": base64.StdEncoding.EncodeToString(mac),
+	}
+	if err := opts.applyPeer(body); err != nil {
+		return err
+	}
+	if opts.Alg != "" {
+		body["alg"] = opts.Alg
+	}
+	return c.req(ctx, "POST", c.baseURL+"/api/crypto/hmac/verify", body, token, nil)
+}
+
+// CipherResult holds the output of CipherEncrypt.
+type CipherResult struct {
+	Ciphertext []byte
+	IV         []byte // generated by the device
+	Tag        []byte // GCM modes only, nil otherwise
+}
+
+// CipherEncrypt encrypts plaintext (max 2048 bytes) with a key in the HEM.
+// The IV is generated by the device. For ECB the plaintext length must be a
+// multiple of 16 bytes.
+// Honours: Alg, ExtKID, PubKey, AAD, Ctx. Scope: keymgmt:use:<KID>
+func (c *Client) CipherEncrypt(ctx context.Context, token, kid string, plaintext []byte, opts CryptoOpts) (*CipherResult, error) {
+	if err := opts.reject("CipherEncrypt", "alg", "aad", "ctx"); err != nil {
+		return nil, err
+	}
+	if err := checkMsgSize("CipherEncrypt", plaintext); err != nil {
+		return nil, err
+	}
+	body := map[string]interface{}{
+		"kid": kid,
 		"msg": base64.StdEncoding.EncodeToString(plaintext),
 	}
-	if extKid != "" {
-		body["ext_kid"] = extKid
-	} else if len(pubkey) > 0 {
-		body["pubkey"] = base64.StdEncoding.EncodeToString(pubkey)
+	if err := opts.applyPeer(body); err != nil {
+		return nil, err
 	}
-	if len(aad) > 0 {
-		body["aad"] = base64.StdEncoding.EncodeToString(aad)
+	if opts.Alg != "" {
+		body["alg"] = opts.Alg
 	}
-	if len(ctx) > 0 {
-		body["ctx"] = base64.StdEncoding.EncodeToString(ctx)
+	if len(opts.AAD) > 0 {
+		body["aad"] = base64.StdEncoding.EncodeToString(opts.AAD)
+	}
+	if len(opts.Ctx) > 0 {
+		body["ctx"] = base64.StdEncoding.EncodeToString(opts.Ctx)
 	}
 	var resp struct {
 		Ciphertext string `json:"ciphertext"`
 		IV         string `json:"iv"`
 		Tag        string `json:"tag"`
 	}
-	if err := c.req("POST", c.baseURL+"/api/crypto/cipher/encrypt", body, token, &resp); err != nil {
+	if err := c.req(ctx, "POST", c.baseURL+"/api/crypto/cipher/encrypt", body, token, &resp); err != nil {
 		return nil, err
 	}
-	result := &CipherEncryptResult{}
-	result.Ciphertext, _ = base64.StdEncoding.DecodeString(resp.Ciphertext)
-	result.IV, _ = base64.StdEncoding.DecodeString(resp.IV)
-	if resp.Tag != "" {
-		result.Tag, _ = base64.StdEncoding.DecodeString(resp.Tag)
+	if resp.Ciphertext == "" {
+		return nil, &HemError{Message: "no ciphertext in encrypt response", Code: "cipher_error"}
 	}
-	return result, nil
+	out := &CipherResult{}
+	out.Ciphertext, _ = base64.StdEncoding.DecodeString(resp.Ciphertext)
+	out.IV, _ = base64.StdEncoding.DecodeString(resp.IV)
+	if resp.Tag != "" {
+		out.Tag, _ = base64.StdEncoding.DecodeString(resp.Tag)
+	}
+	return out, nil
 }
 
-// CipherDecrypt decrypts data using a key stored in the HSM.
-// alg: "AES256-GCM", "AES128-GCM", "AES256-CBC", etc.
-// extKid: KID of a peer CURVE25519 key for ECDH-based decryption; takes priority over pubkey.
-// iv: initialization vector (raw binary); required for GCM/CBC.
-// tag: GCM authentication tag (raw binary, 16B); required for GCM modes.
-// aad: additional authenticated data (raw binary); pass nil to omit.
-// ctx: context field (raw binary); pass nil to omit.
-// pubkey: peer's raw X25519 public key for ECDH-based decryption; used when extKid is empty.
-// Scope: keymgmt:use:<KID>
-func (c *Client) CipherDecrypt(token, kid, alg, extKid string, ciphertext, iv, tag, aad, ctx, pubkey []byte) ([]byte, error) {
-	if extKid != "" && len(pubkey) > 0 {
-		return nil, &HemError{Message: "CipherDecrypt: provide ext_kid or pubkey, not both", Code: "invalid_arg"}
+// CipherDecrypt decrypts ciphertext with a key in the HEM. opts.IV is required
+// for CBC and GCM, opts.Tag for GCM; the remaining options must match the
+// CipherEncrypt call.
+// Honours: Alg, ExtKID, PubKey, AAD, Ctx, IV, Tag. Scope: keymgmt:use:<KID>
+func (c *Client) CipherDecrypt(ctx context.Context, token, kid string, ciphertext []byte, opts CryptoOpts) ([]byte, error) {
+	if err := opts.reject("CipherDecrypt", "alg", "aad", "ctx", "iv", "tag"); err != nil {
+		return nil, err
+	}
+	if err := checkMsgSize("CipherDecrypt", ciphertext); err != nil {
+		return nil, err
 	}
 	body := map[string]interface{}{
 		"kid": kid,
-		"alg": alg,
 		"msg": base64.StdEncoding.EncodeToString(ciphertext),
 	}
-	if extKid != "" {
-		body["ext_kid"] = extKid
-	} else if len(pubkey) > 0 {
-		body["pubkey"] = base64.StdEncoding.EncodeToString(pubkey)
+	if err := opts.applyPeer(body); err != nil {
+		return nil, err
 	}
-	if len(iv) > 0 {
-		body["iv"] = base64.StdEncoding.EncodeToString(iv)
+	if opts.Alg != "" {
+		body["alg"] = opts.Alg
 	}
-	if len(tag) > 0 {
-		body["tag"] = base64.StdEncoding.EncodeToString(tag)
+	if len(opts.IV) > 0 {
+		body["iv"] = base64.StdEncoding.EncodeToString(opts.IV)
 	}
-	if len(aad) > 0 {
-		body["aad"] = base64.StdEncoding.EncodeToString(aad)
+	if len(opts.Tag) > 0 {
+		body["tag"] = base64.StdEncoding.EncodeToString(opts.Tag)
 	}
-	if len(ctx) > 0 {
-		body["ctx"] = base64.StdEncoding.EncodeToString(ctx)
+	if len(opts.AAD) > 0 {
+		body["aad"] = base64.StdEncoding.EncodeToString(opts.AAD)
+	}
+	if len(opts.Ctx) > 0 {
+		body["ctx"] = base64.StdEncoding.EncodeToString(opts.Ctx)
 	}
 	var resp struct {
 		Plaintext string `json:"plaintext"`
 	}
-	if err := c.req("POST", c.baseURL+"/api/crypto/cipher/decrypt", body, token, &resp); err != nil {
+	if err := c.req(ctx, "POST", c.baseURL+"/api/crypto/cipher/decrypt", body, token, &resp); err != nil {
 		return nil, err
 	}
-	return base64.StdEncoding.DecodeString(resp.Plaintext)
-}
-
-// GetPubKey retrieves the public key and metadata for a given key ID.
-// Mirrors getPubKey() in hem-sdk.js.
-func (c *Client) GetPubKey(token, kid string) (pubKey string, keyType string, updated int64, err error) {
-	var resp struct {
-		PubKey  string `json:"pubkey"`
-		Type    string `json:"type"`
-		Updated int64  `json:"updated"`
-	}
-	if err := c.req("GET", c.baseURL+"/api/keymgmt/get/"+kid, nil, token, &resp); err != nil {
-		return "", "", 0, err
-	}
-	return resp.PubKey, resp.Type, resp.Updated, nil
-}
-
-// ECDH performs a Curve25519 ECDH operation on the HSM.
-// kid is the private key ID (32-char hex) stored in the HSM.
-// peerPubKeyBase64 is the peer's WireGuard public key in standard base64.
-// Returns the raw 32-byte shared secret.
-func (c *Client) ECDH(token, kid, peerPubKeyBase64 string) ([]byte, error) {
-	body := map[string]string{
-		"kid":    kid,
-		"pubkey": peerPubKeyBase64,
-	}
-	var resp struct {
-		ECDH string `json:"ecdh"`
-	}
-	if err := c.req("POST", c.baseURL+"/api/crypto/ecdh", body, token, &resp); err != nil {
-		return nil, err
-	}
-	raw, err := base64.StdEncoding.DecodeString(resp.ECDH)
+	raw, err := base64.StdEncoding.DecodeString(resp.Plaintext)
 	if err != nil {
-		return nil, fmt.Errorf("decode ECDH result: %w", err)
+		return nil, &HemError{Message: fmt.Sprintf("decode plaintext: %v", err), Code: "decode_error"}
 	}
 	return raw, nil
 }
 
-// ECDHInternal performs ECDH entirely within the HSM between two stored keys.
-// kid is the local private key, extKid is the peer's imported public key.
-// Neither key value leaves the HSM.
-func (c *Client) ECDHInternal(token, kid, extKid string) ([]byte, error) {
-	body := map[string]string{
-		"kid":     kid,
-		"ext_kid": extKid,
-	}
-	var resp struct {
-		ECDH string `json:"ecdh"`
-	}
-	if err := c.req("POST", c.baseURL+"/api/crypto/ecdh", body, token, &resp); err != nil {
+// CipherWrap wraps key material with a key-encryption key held in the HEM
+// (NIST AES key wrap — 32 bytes in, 40 bytes out, deterministic).
+// With opts.ExtKID or opts.PubKey the KEK is the ECDH shared secret; opts.Ctx
+// then domain-separates it from other wrap uses of the same key, and must be
+// repeated verbatim on unwrap.
+// Honours: Alg, ExtKID, PubKey, Ctx, IV. Scope: keymgmt:use:<KID>
+func (c *Client) CipherWrap(ctx context.Context, token, kid string, data []byte, opts CryptoOpts) ([]byte, error) {
+	if err := opts.reject("CipherWrap", "alg", "ctx", "iv"); err != nil {
 		return nil, err
 	}
-	raw, err := base64.StdEncoding.DecodeString(resp.ECDH)
+	if err := checkMsgSize("CipherWrap", data); err != nil {
+		return nil, err
+	}
+	body := map[string]interface{}{
+		"kid": kid,
+		"msg": base64.StdEncoding.EncodeToString(data),
+	}
+	if err := opts.applyPeer(body); err != nil {
+		return nil, err
+	}
+	if opts.Alg != "" {
+		body["alg"] = opts.Alg
+	}
+	if len(opts.Ctx) > 0 {
+		body["ctx"] = base64.StdEncoding.EncodeToString(opts.Ctx)
+	}
+	if len(opts.IV) > 0 {
+		body["iv"] = base64.StdEncoding.EncodeToString(opts.IV)
+	}
+	var resp struct {
+		Wrapped string `json:"wrapped"`
+	}
+	if err := c.req(ctx, "POST", c.baseURL+"/api/crypto/cipher/wrap", body, token, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Wrapped == "" {
+		return nil, &HemError{Message: "no wrapped in wrap response", Code: "cipher_error"}
+	}
+	raw, err := base64.StdEncoding.DecodeString(resp.Wrapped)
 	if err != nil {
-		return nil, fmt.Errorf("decode ECDH result: %w", err)
+		return nil, &HemError{Message: fmt.Sprintf("decode wrapped: %v", err), Code: "decode_error"}
 	}
 	return raw, nil
+}
+
+// CipherUnwrap reverses CipherWrap. opts must match the wrap call exactly —
+// a differing Ctx yields a different KEK and the unwrap fails.
+// Honours: Alg, ExtKID, PubKey, Ctx, IV. Scope: keymgmt:use:<KID>
+func (c *Client) CipherUnwrap(ctx context.Context, token, kid string, wrapped []byte, opts CryptoOpts) ([]byte, error) {
+	if err := opts.reject("CipherUnwrap", "alg", "ctx", "iv"); err != nil {
+		return nil, err
+	}
+	if err := checkMsgSize("CipherUnwrap", wrapped); err != nil {
+		return nil, err
+	}
+	body := map[string]interface{}{
+		"kid": kid,
+		"msg": base64.StdEncoding.EncodeToString(wrapped),
+	}
+	if err := opts.applyPeer(body); err != nil {
+		return nil, err
+	}
+	if opts.Alg != "" {
+		body["alg"] = opts.Alg
+	}
+	if len(opts.Ctx) > 0 {
+		body["ctx"] = base64.StdEncoding.EncodeToString(opts.Ctx)
+	}
+	if len(opts.IV) > 0 {
+		body["iv"] = base64.StdEncoding.EncodeToString(opts.IV)
+	}
+	var resp struct {
+		Unwrapped string `json:"unwrapped"`
+	}
+	if err := c.req(ctx, "POST", c.baseURL+"/api/crypto/cipher/unwrap", body, token, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Unwrapped == "" {
+		return nil, &HemError{Message: "no unwrapped in unwrap response", Code: "cipher_error"}
+	}
+	raw, err := base64.StdEncoding.DecodeString(resp.Unwrapped)
+	if err != nil {
+		return nil, &HemError{Message: fmt.Sprintf("decode unwrapped: %v", err), Code: "decode_error"}
+	}
+	return raw, nil
+}
+
+// -- System ------------------------------------------------------------------
+
+// Version describes the device hardware, bootloader and firmware.
+type Version struct {
+	HWV  string `json:"hwv"`
+	BLV  string `json:"blv"`
+	FWV  string `json:"fwv"`
+	FWS  string `json:"fws"`
+	Conf string `json:"conf"`
+}
+
+// GetVersion reads the device version. No authorization required, which makes
+// it the natural probe for "is a device reachable at this address".
+func (c *Client) GetVersion(ctx context.Context) (Version, error) {
+	var v Version
+	if err := c.req(ctx, "GET", c.baseURL+"/api/system/version", nil, "", &v); err != nil {
+		return Version{}, err
+	}
+	return v, nil
+}
+
+// GetStatus reads the device runtime status, including the failure-state flag
+// (fls_state) that gates every cryptographic operation. No authorization required.
+func (c *Client) GetStatus(ctx context.Context) (map[string]interface{}, error) {
+	var s map[string]interface{}
+	if err := c.req(ctx, "GET", c.baseURL+"/api/system/status", nil, "", &s); err != nil {
+		return nil, err
+	}
+	return s, nil
 }
