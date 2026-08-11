@@ -104,8 +104,10 @@ type Config struct {
 	// a negative value disables the timeout (the caller's context still applies).
 	Timeout time.Duration
 
-	// InsecureSkipVerify disables TLS certificate verification. Needed for a
-	// PPA presenting a self-signed certificate.
+	// InsecureSkipVerify disables TLS certificate verification. Current PPA and
+	// EPA firmware presents a certificate that verifies normally, so this is for
+	// a device whose certificate has not been provisioned yet, or a test rig
+	// standing in for one — not for ordinary use.
 	InsecureSkipVerify bool
 
 	// DisableTokenCache turns off JWT caching entirely.
@@ -825,7 +827,11 @@ type PubKeyInfo struct {
 }
 
 // GetPubKey retrieves the public key and metadata for a key ID.
-// Scope: keymgmt:use:<KID>
+//
+// Scope: keymgmt:get reads any key's public part; keymgmt:use:<KID> covers that
+// one key and serves as well. A key id the device cannot resolve comes back as
+// HTTP 406, not 404 — the status describes existence here, not permission, and
+// a caller checking whether a key is present has to read it that way.
 func (c *Client) GetPubKey(ctx context.Context, token, kid string) (PubKeyInfo, error) {
 	var resp struct {
 		PubKey  string `json:"pubkey"`
