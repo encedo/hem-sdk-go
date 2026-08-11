@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -241,5 +242,37 @@ func TestAuthPasswordWithoutCachedKey(t *testing.T) {
 	he, ok := err.(*HemError)
 	if !ok || he.Code != "auth_password_required" {
 		t.Fatalf("err = %v, want auth_password_required", err)
+	}
+}
+
+func TestHemErrorShowsWhatTheDeviceSaid(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `{"error":"descr too long"}`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, Config{})
+	err := c.UpdateKey(context.Background(), "tok", "kid", "label", []byte("x"))
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	// "HTTP 400" alone gives a caller nothing to act on.
+	if !strings.Contains(err.Error(), "descr too long") {
+		t.Errorf("the device's explanation should reach the caller, got: %v", err)
+	}
+}
+
+func TestHemErrorWithoutABodyIsUnchanged(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, Config{})
+	err := c.UpdateKey(context.Background(), "tok", "kid", "label", []byte("x"))
+	if err == nil || !strings.Contains(err.Error(), "HTTP 403") {
+		t.Errorf("got: %v", err)
 	}
 }

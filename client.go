@@ -60,7 +60,39 @@ type HemError struct {
 	Data    interface{}
 }
 
-func (e *HemError) Error() string { return e.Message }
+func (e *HemError) Error() string {
+	// The device explains itself in the response body — which argument it did
+	// not like, which state it is in. Dropping that leaves a caller staring at
+	// "HTTP 400" with nothing to act on, so it goes in the message.
+	if detail := e.detail(); detail != "" {
+		return e.Message + ": " + detail
+	}
+	return e.Message
+}
+
+// detail renders the device's response body compactly, preferring the fields it
+// uses for error text over a dump of the whole object.
+func (e *HemError) detail() string {
+	switch v := e.Data.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	case map[string]interface{}:
+		for _, key := range []string{"error", "message", "msg", "reason", "status"} {
+			if s, ok := v[key].(string); ok && s != "" {
+				return s
+			}
+		}
+		out, err := json.Marshal(v)
+		if err != nil || len(out) > 512 {
+			return ""
+		}
+		return string(out)
+	default:
+		return ""
+	}
+}
 
 // Config configures a Client. The zero value is valid: it selects the public
 // broker, a 10 s request timeout, verified TLS and caching enabled.
@@ -756,8 +788,13 @@ func (c *Client) ImportKey(ctx context.Context, token, label, keyType string, pu
 }
 
 // UpdateKey updates a key's label and/or description.
-// An empty label leaves the label unchanged; a nil descr leaves the description
-// unchanged. At least one of the two must be set.
+// An empty label omits the field, a nil descr omits it likewise, and at least
+// one of the two must be set.
+//
+// Note that the reference test suite always sends both (hem-api-tester,
+// test_10.php), and a device may reject an update that carries only a
+// description. Passing the key's current label alongside a new description is
+// the safe shape.
 // Scope: keymgmt:upd
 func (c *Client) UpdateKey(ctx context.Context, token, kid, label string, descr []byte) error {
 	if label == "" && descr == nil {
