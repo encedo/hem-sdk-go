@@ -340,6 +340,17 @@ func (c *Client) ClearKeys() {
 	c.seedID = ""
 }
 
+// TokenExpiry returns the exp claim of a scoped token, or the zero time if it
+// carries none.
+//
+// Callers need this rather than the lifetime they asked for. A device may issue
+// a token shorter than the request, and its clock is its own: a run on
+// 2026-08-11 asked for eight hours and the session ended after seven and a half.
+// Anything counting down towards the end of a session — a status line, a
+// countdown in an interface — has to read the token rather than the request, or
+// it will be confidently wrong in the direction that strands somebody.
+func TokenExpiry(token string) time.Time { return jwtExp(token) }
+
 // jwtExp returns the exp claim of a JWT, or the zero time if it has none.
 func jwtExp(token string) time.Time {
 	parts := strings.Split(token, ".")
