@@ -539,7 +539,7 @@ func (c *Client) seedFor(password []byte, eid string) (seed []byte, pubKeyB64 st
 	}
 	if password == nil {
 		return nil, "", &HemError{
-			Message: "no cached key for this device — a password is required",
+			Message: "no cached key for this device: a password is required",
 			Code:    "auth_password_required",
 		}
 	}
