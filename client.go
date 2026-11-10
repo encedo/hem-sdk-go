@@ -143,14 +143,20 @@ type Client struct {
 	httpClient *http.Client
 
 	mu     sync.Mutex
-	tokens map[string]cachedToken
+	tokens []cachedToken
 	seed   []byte // X25519 seed derived from the password
 	seedID string // device eid the seed was derived for
 }
 
+// A cached token answers for every scope it holds (DEV-436): the device grants
+// a call when any value of the token's scope matches, so one token for
+// [keymgmt:use:<kid>, keymgmt:get] also serves a later keymgmt:get. What it
+// holds is read from the token itself - a phone may approve less than was
+// asked.
 type cachedToken struct {
-	jwt string
-	exp time.Time
+	scopes []string
+	jwt    string
+	exp    time.Time
 }
 
 // NewClient creates a client for the HEM at hsmURL.
@@ -281,47 +287,102 @@ func (c *Client) do(ctx context.Context, method, url string, body interface{}, t
 
 // -- Token and key cache -----------------------------------------------------
 
-func (c *Client) cacheable(scope string) bool {
+func (c *Client) cacheable(scopes []string) bool {
 	if c.cacheOff {
 		return false
 	}
-	for _, s := range c.noCache {
-		if s == scope || (strings.HasSuffix(s, ":") && strings.HasPrefix(scope, s)) {
+	for _, scope := range scopes {
+		for _, s := range c.noCache {
+			if s == scope || (strings.HasSuffix(s, ":") && strings.HasPrefix(scope, s)) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (c *Client) cacheFind(wanted []string) (string, bool) {
+	if !c.cacheable(wanted) {
+		return "", false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cachePurge()
+	for _, t := range c.tokens {
+		if coversAll(t.scopes, wanted) {
+			return t.jwt, true
+		}
+	}
+	return "", false
+}
+
+func (c *Client) cacheStore(requested []string, jwt string) {
+	granted := TokenScopes(jwt)
+	if granted == nil {
+		granted = requested
+	}
+	if !c.cacheable(granted) {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cachePurge()
+	c.tokens = append(c.tokens, cachedToken{scopes: granted, jwt: jwt, exp: jwtExp(jwt)})
+}
+
+// cachePurge drops expired tokens. The caller holds c.mu.
+func (c *Client) cachePurge() {
+	now := time.Now()
+	kept := c.tokens[:0]
+	for _, t := range c.tokens {
+		if t.exp.IsZero() || now.Before(t.exp.Add(-tokenSkew)) {
+			kept = append(kept, t)
+		}
+	}
+	for i := len(kept); i < len(c.tokens); i++ {
+		c.tokens[i] = cachedToken{}
+	}
+	c.tokens = kept
+}
+
+func coversAll(have, wanted []string) bool {
+	for _, w := range wanted {
+		found := false
+		for _, h := range have {
+			if h == w {
+				found = true
+				break
+			}
+		}
+		if !found {
 			return false
 		}
 	}
 	return true
 }
 
-func (c *Client) cacheFind(scope string) (string, bool) {
-	if !c.cacheable(scope) {
-		return "", false
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	now := time.Now()
-	for s, t := range c.tokens {
-		if !t.exp.IsZero() && now.After(t.exp.Add(-tokenSkew)) {
-			delete(c.tokens, s)
+// MaxScopes is the most values one token can carry (DEV-436).
+const MaxScopes = 8
+
+// checkScopes catches the shape the device answers with a bare 400: 1..8
+// distinct non-empty values of at most 44 characters, at most one storage:*.
+func checkScopes(scopes []string) error {
+	bad := len(scopes) < 1 || len(scopes) > MaxScopes
+	storage := 0
+	seen := make(map[string]bool, len(scopes))
+	for _, s := range scopes {
+		if s == "" || len(s) > 44 || seen[s] {
+			bad = true
+		}
+		seen[s] = true
+		if strings.HasPrefix(s, "storage:") {
+			storage++
 		}
 	}
-	t, ok := c.tokens[scope]
-	if !ok {
-		return "", false
+	if bad || storage > 1 {
+		return &HemError{Message: "a scope is 1..8 distinct values of at most 44 characters, with at most one storage:*", Code: "invalid_arg"}
 	}
-	return t.jwt, true
-}
-
-func (c *Client) cacheStore(scope, jwt string) {
-	if !c.cacheable(scope) {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.tokens == nil {
-		c.tokens = make(map[string]cachedToken)
-	}
-	c.tokens[scope] = cachedToken{jwt: jwt, exp: jwtExp(jwt)}
+	return nil
 }
 
 // ClearCache drops every cached JWT. The derived key, if any, is kept.
@@ -353,23 +414,53 @@ func (c *Client) ClearKeys() {
 // it will be confidently wrong in the direction that strands somebody.
 func TokenExpiry(token string) time.Time { return jwtExp(token) }
 
+// TokenScopes returns the scope values a token holds - one for a string scope,
+// several for an array - or nil if it cannot be read. After AuthRemoteScopes it
+// is how a caller learns what the phone actually approved, which may be less
+// than was asked.
+func TokenScopes(token string) []string {
+	var claims struct {
+		Scope json.RawMessage `json:"scope"`
+	}
+	if !jwtClaims(token, &claims) || len(claims.Scope) == 0 {
+		return nil
+	}
+	var one string
+	if json.Unmarshal(claims.Scope, &one) == nil {
+		if one == "" {
+			return nil
+		}
+		return []string{one}
+	}
+	var many []string
+	if json.Unmarshal(claims.Scope, &many) == nil && len(many) > 0 {
+		return many
+	}
+	return nil
+}
+
 // jwtExp returns the exp claim of a JWT, or the zero time if it has none.
 func jwtExp(token string) time.Time {
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		return time.Time{}
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return time.Time{}
-	}
 	var claims struct {
 		Exp int64 `json:"exp"`
 	}
-	if err := json.Unmarshal(payload, &claims); err != nil || claims.Exp == 0 {
+	if !jwtClaims(token, &claims) || claims.Exp == 0 {
 		return time.Time{}
 	}
 	return time.Unix(claims.Exp, 0)
+}
+
+// jwtClaims decodes the payload of a JWT into out, without checking anything.
+func jwtClaims(token string, out interface{}) bool {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return false
+	}
+	return json.Unmarshal(payload, out) == nil
 }
 
 // -- Checkin -----------------------------------------------------------------
@@ -468,8 +559,25 @@ func buildEjwt(seed []byte, devicePubKeyB64 string, payload map[string]interface
 //
 // The caller owns password and is responsible for zeroing it; the SDK does not,
 // precisely so that it can be passed to several AuthPassword calls in a row.
+//
+// The token carries scope as a string. AuthPasswordScopes asks for several.
 func (c *Client) AuthPassword(ctx context.Context, password []byte, scope string, expSeconds int) (string, error) {
-	if jwt, ok := c.cacheFind(scope); ok {
+	return c.authPassword(ctx, password, scope, []string{scope}, expSeconds)
+}
+
+// AuthPasswordScopes is AuthPassword for a token holding up to MaxScopes
+// values (DEV-436), sent as an array even when there is one. A cached token
+// holding all of them is returned without asking the device.
+func (c *Client) AuthPasswordScopes(ctx context.Context, password []byte, scopes []string, expSeconds int) (string, error) {
+	return c.authPassword(ctx, password, append([]string(nil), scopes...), scopes, expSeconds)
+}
+
+// wire is what goes into the scope claim: a string or a []string, as given.
+func (c *Client) authPassword(ctx context.Context, password []byte, wire interface{}, scopes []string, expSeconds int) (string, error) {
+	if err := checkScopes(scopes); err != nil {
+		return "", err
+	}
+	if jwt, ok := c.cacheFind(scopes); ok {
 		return jwt, nil
 	}
 
@@ -497,7 +605,7 @@ func (c *Client) AuthPassword(ctx context.Context, password []byte, scope string
 		"exp":   iat + int64(expSeconds),
 		"iat":   iat,
 		"iss":   pubKeyB64,
-		"scope": scope,
+		"scope": wire,
 	}
 
 	ejwt, err := buildEjwt(seed, challenge.SPK, payload)
@@ -514,7 +622,7 @@ func (c *Client) AuthPassword(ctx context.Context, password []byte, scope string
 	if resp.Token == "" {
 		return "", &HemError{Message: "no token in auth response", Code: "auth_failed"}
 	}
-	c.cacheStore(scope, resp.Token)
+	c.cacheStore(scopes, resp.Token)
 	return resp.Token, nil
 }
 
@@ -574,7 +682,23 @@ type RemoteOpts struct {
 // JWT. The user approves the request in the Encedo authenticator app.
 // Cancelling ctx aborts the wait and returns ctx.Err().
 func (c *Client) AuthRemote(ctx context.Context, scope string, opts RemoteOpts) (string, error) {
-	if jwt, ok := c.cacheFind(scope); ok {
+	return c.authRemote(ctx, scope, []string{scope}, opts)
+}
+
+// AuthRemoteScopes is AuthRemote for a token holding up to MaxScopes values,
+// shown together in one approval. The app may approve fewer than were asked:
+// TokenScopes on the result says which. Put keymgmt:use:<kid> first - the
+// device attaches the key's label to the first such value, and the phone shows
+// it.
+func (c *Client) AuthRemoteScopes(ctx context.Context, scopes []string, opts RemoteOpts) (string, error) {
+	return c.authRemote(ctx, append([]string(nil), scopes...), scopes, opts)
+}
+
+func (c *Client) authRemote(ctx context.Context, wire interface{}, scopes []string, opts RemoteOpts) (string, error) {
+	if err := checkScopes(scopes); err != nil {
+		return "", err
+	}
+	if jwt, ok := c.cacheFind(scopes); ok {
 		return jwt, nil
 	}
 	pollInterval := opts.PollInterval
@@ -593,7 +717,7 @@ func (c *Client) AuthRemote(ctx context.Context, scope string, opts RemoteOpts) 
 	}
 
 	// Step 2: request auth from the device (full session data + scope)
-	session["scope"] = scope
+	session["scope"] = wire
 	var challenge map[string]interface{}
 	if err := c.req(ctx, "POST", c.baseURL+"/api/auth/ext/request", session, "", &challenge); err != nil {
 		return "", err
@@ -658,92 +782,248 @@ func (c *Client) AuthRemote(ctx context.Context, scope string, opts RemoteOpts) 
 	if tokenResp.Token == "" {
 		return "", &HemError{Message: "no token in ext/token response", Code: "auth_failed"}
 	}
-	c.cacheStore(scope, tokenResp.Token)
+	c.cacheStore(scopes, tokenResp.Token)
 	return tokenResp.Token, nil
 }
 
 // -- Key management ----------------------------------------------------------
 
-// KeyEntry represents a single key entry returned by ListKeys and SearchKeys.
+// KeyEntry is one key of a list or search page.
 type KeyEntry struct {
-	KID     string
-	Label   string
+	KID   string
+	Label string
+	// Type is the key type, e.g. CURVE25519; the device reports usage flags in
+	// front of it ("ECDH,ExDSA,SECP256R1"), and those are in Flags.
 	Type    string
+	Flags   []string
 	Created int64
 	Updated int64
 	Descr   []byte // raw binary, nil if not set
+	// PubKey is set only when the page was asked for public keys and the
+	// device allows it (pubkey_in_search / pubkey_in_list); never on an
+	// anonymous search.
+	PubKey []byte
+	Der    []byte // a GENERIC_DER record's content, when the device sends it
 }
+
+// KeyPage is one page of a list or search.
+//
+// The next page starts at Offset+Listed. For a list Listed can exceed
+// len(Keys): a record failing its CRC takes a slot (Invalid) and is not in
+// Keys. For a search Listed equals len(Keys) and Total counts every record,
+// not the matches, so a search ends on a page that lists nothing.
+type KeyPage struct {
+	Keys    []KeyEntry
+	Offset  int
+	Total   int
+	Listed  int
+	Deleted int
+	Invalid int
+}
+
+// PageSize is the most entries the device returns in one page. A page asked
+// for public keys ends earlier, after 3 post-quantum keys.
+const PageSize = 15
 
 // listResp is the shared response shape for the list and search endpoints.
 type listResp struct {
-	Offset int `json:"offset"`
-	Total  int `json:"total"`
-	Listed int `json:"listed"`
-	List   []struct {
+	Offset  *int `json:"offset"`
+	Total   *int `json:"total"`
+	Listed  *int `json:"listed"`
+	Deleted int  `json:"deleted"`
+	Invalid int  `json:"invalid"`
+	List    []struct {
 		KID     string `json:"kid"`
 		Label   string `json:"label"`
 		Type    string `json:"type"`
 		Created int64  `json:"created"`
 		Updated int64  `json:"updated"`
-		Descr   string `json:"descr"` // base64-encoded by the HEM API
+		Descr   string `json:"descr"`  // base64
+		PubKey  string `json:"pubkey"` // base64
+		Der     string `json:"der"`    // base64
 	} `json:"list"`
 }
 
-func parseKeyList(resp listResp) []KeyEntry {
-	entries := make([]KeyEntry, 0, len(resp.List))
+func keyPage(resp listResp, offset int) KeyPage {
+	page := KeyPage{Keys: make([]KeyEntry, 0, len(resp.List)), Offset: offset,
+		Deleted: resp.Deleted, Invalid: resp.Invalid}
 	for _, e := range resp.List {
-		entry := KeyEntry{
-			KID: e.KID, Label: e.Label, Type: e.Type,
-			Created: e.Created, Updated: e.Updated,
+		entry := KeyEntry{KID: e.KID, Label: e.Label, Created: e.Created, Updated: e.Updated}
+		if parts := splitNonEmpty(e.Type); len(parts) > 0 {
+			entry.Type = parts[len(parts)-1]
+			entry.Flags = parts[:len(parts)-1]
 		}
-		if e.Descr != "" {
-			entry.Descr, _ = base64.StdEncoding.DecodeString(e.Descr)
-		}
-		entries = append(entries, entry)
+		entry.Descr = b64OrNil(e.Descr)
+		entry.PubKey = b64OrNil(e.PubKey)
+		entry.Der = b64OrNil(e.Der)
+		page.Keys = append(page.Keys, entry)
 	}
-	return entries
+	page.Total, page.Listed = len(page.Keys), len(page.Keys)
+	if resp.Offset != nil {
+		page.Offset = *resp.Offset
+	}
+	if resp.Total != nil {
+		page.Total = *resp.Total
+	}
+	if resp.Listed != nil {
+		page.Listed = *resp.Listed
+	}
+	return page
 }
 
-// ListKeys returns a page of the key repository.
+func splitNonEmpty(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func b64OrNil(s string) []byte {
+	if s == "" {
+		return nil
+	}
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// ListOpts selects a page of ListKeys.
+type ListOpts struct {
+	Offset int
+	Limit  int // 0 selects PageSize; the device caps it there
+	// ReturnPubkey adds public keys - only on a device personalised with the
+	// pubkey_in_list policy, ignored without it.
+	ReturnPubkey bool
+}
+
+// ListKeys returns one page of the key repository, in storage order (a
+// changed key moves to the end).
 // Scope: keymgmt:list
-func (c *Client) ListKeys(ctx context.Context, token string, offset, limit int) (total int, keys []KeyEntry, err error) {
-	var resp listResp
-	url := fmt.Sprintf("%s/api/keymgmt/list/%d/%d", c.baseURL, offset, limit)
-	if err := c.req(ctx, "GET", url, nil, token, &resp); err != nil {
-		return 0, nil, err
+func (c *Client) ListKeys(ctx context.Context, token string, opts ListOpts) (KeyPage, error) {
+	limit := opts.Limit
+	if limit <= 0 {
+		limit = PageSize
 	}
-	return resp.Total, parseKeyList(resp), nil
+	url := fmt.Sprintf("%s/api/keymgmt/list/%d/%d", c.baseURL, opts.Offset, limit)
+	if opts.ReturnPubkey {
+		url += "/pubkey"
+	}
+	var resp listResp
+	if err := c.req(ctx, "GET", url, nil, token, &resp); err != nil {
+		return KeyPage{}, err
+	}
+	return keyPage(resp, opts.Offset), nil
 }
 
-// SearchKeys returns the keys whose descr field starts with pattern.
-//
-// pattern is raw binary; the '^' anchor the device expects is applied to the
-// base64 form, not to the bytes. Only prefix matching is available — a suffix
-// anchor ('$') is neither documented nor exercised by the certification test
-// suite, so it is left out until the firmware behaviour is confirmed.
-//
-// limit <= 0 leaves the device default (15 entries) in place. Paginate by
-// adding len(keys) to offset until offset reaches total.
-//
-// Pass token="" for anonymous access, which the device permits when
-// allow_keysearch is configured and pattern is at least 6 bytes long.
-// Scope: keymgmt:search (or keymgmt:list + auth:ext:pair)
-func (c *Client) SearchKeys(ctx context.Context, token string, pattern []byte, offset, limit int) (total int, keys []KeyEntry, err error) {
-	if offset < 0 {
-		offset = 0
+// ListKeysAll pages through the whole repository: on from Offset+Listed until
+// that reaches Total. A page that lists nothing ends the walk too, so a device
+// that answered short cannot spin it forever.
+// Scope: keymgmt:list
+func (c *Client) ListKeysAll(ctx context.Context, token string, returnPubkey bool) ([]KeyEntry, error) {
+	var all []KeyEntry
+	for offset := 0; ; {
+		page, err := c.ListKeys(ctx, token, ListOpts{Offset: offset, ReturnPubkey: returnPubkey})
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, page.Keys...)
+		if page.Listed <= 0 {
+			return all, nil
+		}
+		offset += page.Listed
+		if offset >= page.Total || offset > 0xffff {
+			return all, nil
+		}
 	}
-	body := map[string]interface{}{
-		"descr":  "^" + base64.StdEncoding.EncodeToString(pattern),
-		"offset": offset,
+}
+
+// Match is where a search pattern has to sit in a key's descr.
+type Match int
+
+const (
+	MatchPrefix   Match = iota // descr starts with the pattern (the zero value)
+	MatchSuffix                // descr ends with it
+	MatchContains              // anywhere
+)
+
+// SearchOpts narrows a search. The zero value is a prefix search of the first
+// page.
+type SearchOpts struct {
+	Match  Match
+	Offset int // matches to skip
+	Limit  int // 0 selects PageSize; the device caps it there
+	Type   string
+	// Mode keeps keys with all of these flags: ECDH, ExDSA, "ECDH,ExDSA", HPKE.
+	Mode string
+	// ReturnPubkey adds public keys - only with the pubkey_in_search policy,
+	// and never on an anonymous search.
+	ReturnPubkey bool
+}
+
+// SearchKeys returns one page of the keys whose descr matches pattern (raw
+// bytes, 1..128; the anchor is applied to the base64 form).
+//
+// Pass token="" for an anonymous search, which the device answers only for a
+// prefix of at least 6 bytes and only when allow_keysearch is on; public keys
+// are then left out.
+// Scope: keymgmt:search, keymgmt:list or auth:ext:pair
+func (c *Client) SearchKeys(ctx context.Context, token string, pattern []byte, opts SearchOpts) (KeyPage, error) {
+	b := base64.StdEncoding.EncodeToString(pattern)
+	switch opts.Match {
+	case MatchPrefix:
+		b = "^" + b
+	case MatchSuffix:
+		b += "$"
 	}
-	if limit > 0 {
-		body["limit"] = limit
+	limit := opts.Limit
+	if limit <= 0 {
+		limit = PageSize
+	}
+	body := map[string]interface{}{"descr": b, "offset": opts.Offset, "limit": limit}
+	if opts.Type != "" {
+		body["type"] = opts.Type
+	}
+	if opts.Mode != "" {
+		body["mode"] = opts.Mode
+	}
+	if opts.ReturnPubkey {
+		body["return_pubkey"] = true
 	}
 	var resp listResp
 	if err := c.req(ctx, "POST", c.baseURL+"/api/keymgmt/search", body, token, &resp); err != nil {
-		return 0, nil, err
+		return KeyPage{}, err
 	}
-	return resp.Total, parseKeyList(resp), nil
+	return keyPage(resp, opts.Offset), nil
+}
+
+// SearchKeysAll returns every key SearchKeys would find, across pages. A
+// search page can end early (after 3 post-quantum keys with public keys) and
+// its Total counts every record, not the matches, so the walk goes on from
+// Offset+Listed until a page lists nothing - the device's rule, at the price
+// of one request that finds nothing. opts.Offset and opts.Limit are ignored.
+// Scope: as SearchKeys
+func (c *Client) SearchKeysAll(ctx context.Context, token string, pattern []byte, opts SearchOpts) ([]KeyEntry, error) {
+	var all []KeyEntry
+	opts.Limit = PageSize
+	for opts.Offset = 0; ; {
+		page, err := c.SearchKeys(ctx, token, pattern, opts)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, page.Keys...)
+		if page.Listed <= 0 {
+			return all, nil
+		}
+		opts.Offset += page.Listed
+		if opts.Offset > 0xffff {
+			return all, nil
+		}
+	}
 }
 
 // CreateKey generates a new key in the repository and returns its KID.

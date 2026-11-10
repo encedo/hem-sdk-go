@@ -43,9 +43,9 @@ func serve(t *testing.T, reply string) (*Client, *capture) {
 func b64(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
 
 func TestSearchKeysWireFormat(t *testing.T) {
-	c, rec := serve(t, `{"offset":0,"total":1,"listed":1,"list":[{"kid":"ab","descr":"`+b64("WG:if:x")+`"}]}`)
+	c, rec := serve(t, `{"offset":0,"total":9,"listed":1,"list":[{"kid":"ab","type":"ECDH,CURVE25519","descr":"`+b64("WG:if:x")+`"}]}`)
 
-	total, keys, err := c.SearchKeys(context.Background(), "", []byte("WG:if:"), 0, 0)
+	page, err := c.SearchKeys(context.Background(), "", []byte("WG:if:"), SearchOpts{})
 	if err != nil {
 		t.Fatalf("SearchKeys: %v", err)
 	}
@@ -56,33 +56,221 @@ func TestSearchKeysWireFormat(t *testing.T) {
 	if got, want := rec.body["descr"], "^"+b64("WG:if:"); got != want {
 		t.Errorf("descr = %v, want %v", got, want)
 	}
-	if _, ok := rec.body["offset"]; !ok {
-		t.Error("offset must always be sent")
+	if rec.body["offset"] != float64(0) || rec.body["limit"] != float64(PageSize) {
+		t.Errorf("offset/limit = %v/%v, want 0/%d as the JS SDK sends", rec.body["offset"], rec.body["limit"], PageSize)
 	}
-	if _, ok := rec.body["limit"]; ok {
-		t.Error("limit must be omitted when <= 0 so the device default applies")
+	for _, k := range []string{"return_pubkey", "type", "mode"} {
+		if _, ok := rec.body[k]; ok {
+			t.Errorf("%s sent when not asked for", k)
+		}
 	}
 	if rec.auth != "" {
 		t.Error("anonymous search must not send an Authorization header")
 	}
-	if total != 1 || len(keys) != 1 || string(keys[0].Descr) != "WG:if:x" {
-		t.Errorf("total=%d keys=%+v", total, keys)
+	if page.Total != 9 || page.Listed != 1 || len(page.Keys) != 1 {
+		t.Fatalf("page = %+v", page)
+	}
+	k := page.Keys[0]
+	if string(k.Descr) != "WG:if:x" || k.Type != "CURVE25519" || len(k.Flags) != 1 || k.Flags[0] != "ECDH" || k.PubKey != nil {
+		t.Errorf("entry = %+v", k)
 	}
 }
 
-func TestSearchKeysSendsLimit(t *testing.T) {
-	c, rec := serve(t, `{"total":0,"listed":0,"list":[]}`)
-	if _, _, err := c.SearchKeys(context.Background(), "tok", []byte("WG:pr:"), 30, 50); err != nil {
+func TestSearchKeysOptions(t *testing.T) {
+	pub := "32-byte-curve25519-public-key---"
+	c, rec := serve(t, `{"total":3,"listed":1,"list":[{"kid":"ab","type":"CURVE25519","pubkey":"`+b64(pub)+`"}]}`)
+	page, err := c.SearchKeys(context.Background(), "tok", []byte("WG:pr:"), SearchOpts{
+		Match: MatchSuffix, Offset: 30, Limit: 5, Type: "CURVE25519", Mode: "ECDH", ReturnPubkey: true})
+	if err != nil {
 		t.Fatalf("SearchKeys: %v", err)
 	}
-	if rec.body["offset"] != json.Number("30") && rec.body["offset"] != float64(30) {
-		t.Errorf("offset = %v", rec.body["offset"])
+	if got, want := rec.body["descr"], b64("WG:pr:")+"$"; got != want {
+		t.Errorf("descr = %v, want %v", got, want)
 	}
-	if rec.body["limit"] != json.Number("50") && rec.body["limit"] != float64(50) {
-		t.Errorf("limit = %v", rec.body["limit"])
+	if rec.body["offset"] != float64(30) || rec.body["limit"] != float64(5) {
+		t.Errorf("offset/limit = %v/%v", rec.body["offset"], rec.body["limit"])
+	}
+	if rec.body["type"] != "CURVE25519" || rec.body["mode"] != "ECDH" || rec.body["return_pubkey"] != true {
+		t.Errorf("body = %v", rec.body)
 	}
 	if rec.auth != "Bearer tok" {
 		t.Errorf("auth = %q", rec.auth)
+	}
+	if page.Offset != 30 || string(page.Keys[0].PubKey) != pub {
+		t.Errorf("page = %+v", page)
+	}
+
+	if _, err := c.SearchKeys(context.Background(), "tok", []byte("WG"), SearchOpts{Match: MatchContains}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := rec.body["descr"], b64("WG"); got != want {
+		t.Errorf("contains: descr = %v, want %v", got, want)
+	}
+}
+
+// A search walks on Listed until a page lists nothing: Total counts every
+// record, so it cannot end the walk, and a page with public keys can end
+// after 3 PQC keys with fewer than PageSize entries.
+func TestSearchKeysAllPagesOnListed(t *testing.T) {
+	var offsets []float64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		off := body["offset"].(float64)
+		offsets = append(offsets, off)
+		switch off {
+		case 0:
+			io.WriteString(w, `{"total":40,"listed":3,"list":[{"kid":"a"},{"kid":"b"},{"kid":"c"}]}`)
+		case 3:
+			io.WriteString(w, `{"total":40,"listed":1,"list":[{"kid":"d"}]}`)
+		default:
+			io.WriteString(w, `{"total":40,"listed":0,"list":[]}`)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := NewClient(srv.URL, Config{})
+	keys, err := c.SearchKeysAll(context.Background(), "", []byte("WG:pr:"), SearchOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 4 || len(offsets) != 3 || offsets[1] != 3 || offsets[2] != 4 {
+		t.Errorf("keys=%d offsets=%v", len(keys), offsets)
+	}
+}
+
+// A list page counts a record failing its CRC in Listed without putting it in
+// the list; paging on len(list) would read the next record twice.
+func TestListKeysAllPagesOnListed(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		switch r.URL.Path {
+		case "/api/keymgmt/list/0/15/pubkey":
+			io.WriteString(w, `{"total":3,"listed":2,"invalid":1,"list":[{"kid":"a"}]}`)
+		default:
+			io.WriteString(w, `{"total":3,"listed":1,"list":[{"kid":"c"}]}`)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := NewClient(srv.URL, Config{})
+	keys, err := c.ListKeysAll(context.Background(), "tok", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 2 || len(paths) != 2 || paths[1] != "/api/keymgmt/list/2/15/pubkey" {
+		t.Errorf("keys=%v paths=%v", keys, paths)
+	}
+}
+
+func fakeJWT(claims map[string]interface{}) string {
+	raw, _ := json.Marshal(claims)
+	return "e30." + base64.RawURLEncoding.EncodeToString(raw) + ".sig"
+}
+
+func TestTokenScopes(t *testing.T) {
+	if got := TokenScopes(fakeJWT(map[string]interface{}{"scope": "keymgmt:get"})); len(got) != 1 || got[0] != "keymgmt:get" {
+		t.Errorf("string scope: %v", got)
+	}
+	got := TokenScopes(fakeJWT(map[string]interface{}{"scope": []string{"keymgmt:use:ab", "keymgmt:get"}}))
+	if len(got) != 2 || got[1] != "keymgmt:get" {
+		t.Errorf("array scope: %v", got)
+	}
+	if TokenScopes("not.a.jwt") != nil || TokenScopes(fakeJWT(map[string]interface{}{})) != nil {
+		t.Error("unreadable scope must be nil")
+	}
+}
+
+// A cached token answers for every scope it holds, and only for what the
+// token itself says it holds - not what was asked.
+func TestTokenCacheCoversGrantedScopes(t *testing.T) {
+	c := NewClient("https://hem.invalid", Config{})
+	exp := time.Now().Add(time.Hour).Unix()
+	jwt := fakeJWT(map[string]interface{}{"exp": exp, "scope": []string{"keymgmt:use:ab", "keymgmt:get"}})
+	c.cacheStore([]string{"keymgmt:use:ab", "keymgmt:get", "keymgmt:search"}, jwt)
+
+	for _, want := range [][]string{{"keymgmt:get"}, {"keymgmt:use:ab"}, {"keymgmt:get", "keymgmt:use:ab"}} {
+		if got, ok := c.cacheFind(want); !ok || got != jwt {
+			t.Errorf("%v not served from the cache", want)
+		}
+	}
+	if _, ok := c.cacheFind([]string{"keymgmt:search"}); ok {
+		t.Error("a scope the phone did not approve was served from the cache")
+	}
+	if _, ok := c.cacheFind([]string{"keymgmt:get", "keymgmt:del"}); ok {
+		t.Error("a partial match was served")
+	}
+
+	c.cacheStore([]string{"keymgmt:del"}, fakeJWT(map[string]interface{}{"exp": time.Now().Add(-time.Minute).Unix(), "scope": "keymgmt:del"}))
+	if _, ok := c.cacheFind([]string{"keymgmt:del"}); ok {
+		t.Error("an expired token was served")
+	}
+}
+
+func TestNoCacheScopesInsideAnArray(t *testing.T) {
+	c := NewClient("https://hem.invalid", Config{NoCacheScopes: []string{"keymgmt:use:"}})
+	jwt := fakeJWT(map[string]interface{}{"exp": time.Now().Add(time.Hour).Unix(), "scope": []string{"keymgmt:use:ab", "keymgmt:get"}})
+	c.cacheStore([]string{"keymgmt:use:ab", "keymgmt:get"}, jwt)
+	if _, ok := c.cacheFind([]string{"keymgmt:get"}); ok {
+		t.Error("a token holding a no-cache scope was cached")
+	}
+}
+
+func TestCheckScopes(t *testing.T) {
+	ok := [][]string{{"keymgmt:get"}, {"keymgmt:use:00112233445566778899aabbccddeeff", "keymgmt:get"}}
+	bad := [][]string{nil, {""}, {"a", "a"}, {"storage:disk0", "storage:disk1:ro"},
+		{"1", "2", "3", "4", "5", "6", "7", "8", "9"}, {strings.Repeat("x", 45)}}
+	for _, s := range ok {
+		if err := checkScopes(s); err != nil {
+			t.Errorf("%v: %v", s, err)
+		}
+	}
+	for _, s := range bad {
+		if err := checkScopes(s); err == nil {
+			t.Errorf("%v accepted", s)
+		}
+	}
+}
+
+// AuthRemoteScopes sends the scope as an array, AuthRemote as a string: the
+// device issues the token with the type that was asked for.
+func TestAuthRemoteScopeWireType(t *testing.T) {
+	var sent []interface{}
+	var srvURL string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		switch r.URL.Path {
+		case "/notify/session":
+			io.WriteString(w, `{"epk":"x"}`)
+		case "/api/auth/ext/request":
+			sent = append(sent, body["scope"])
+			io.WriteString(w, `{"authreq":"r"}`)
+		case "/notify/event/new":
+			io.WriteString(w, `{"eventid":"e1"}`)
+		case "/notify/event/check/e1":
+			io.WriteString(w, `{"authreply":"ok"}`)
+		case "/api/auth/ext/token":
+			io.WriteString(w, `{"token":"`+fakeJWT(map[string]interface{}{"exp": time.Now().Add(time.Hour).Unix(), "scope": "keymgmt:get"})+`"}`)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	srvURL = srv.URL
+	c := NewClient(srvURL, Config{Broker: srvURL, DisableTokenCache: true})
+	opts := RemoteOpts{PollInterval: time.Millisecond}
+	if _, err := c.AuthRemote(context.Background(), "keymgmt:get", opts); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.AuthRemoteScopes(context.Background(), []string{"keymgmt:use:ab", "keymgmt:get"}, opts); err != nil {
+		t.Fatal(err)
+	}
+	if len(sent) != 2 {
+		t.Fatalf("sent = %v", sent)
+	}
+	if _, ok := sent[0].(string); !ok {
+		t.Errorf("AuthRemote sent %T, want a string", sent[0])
+	}
+	if arr, ok := sent[1].([]interface{}); !ok || len(arr) != 2 || arr[0] != "keymgmt:use:ab" {
+		t.Errorf("AuthRemoteScopes sent %v, want the array in order", sent[1])
 	}
 }
 
@@ -245,14 +433,14 @@ func TestTokenCacheHonoursNoCacheScopes(t *testing.T) {
 	jwt := "h." + base64.RawURLEncoding.EncodeToString([]byte(`{"exp":`+
 		strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10)+`}`)) + ".s"
 
-	c.cacheStore("keymgmt:list", jwt)
-	c.cacheStore("keymgmt:use:abcd", jwt)
+	c.cacheStore([]string{"keymgmt:list"}, jwt)
+	c.cacheStore([]string{"keymgmt:use:abcd"}, jwt)
 
-	if _, ok := c.cacheFind("keymgmt:list"); !ok {
+	if _, ok := c.cacheFind([]string{"keymgmt:list"}); !ok {
 		t.Error("keymgmt:list should be cached")
 	}
 	// A trailing ':' in NoCacheScopes matches by prefix, covering every KID.
-	if _, ok := c.cacheFind("keymgmt:use:abcd"); ok {
+	if _, ok := c.cacheFind([]string{"keymgmt:use:abcd"}); ok {
 		t.Error("keymgmt:use:* must not be cached")
 	}
 }
@@ -262,8 +450,8 @@ func TestTokenCacheDropsExpired(t *testing.T) {
 	expired := "h." + base64.RawURLEncoding.EncodeToString([]byte(`{"exp":`+
 		strconv.FormatInt(time.Now().Add(-time.Minute).Unix(), 10)+`}`)) + ".s"
 
-	c.cacheStore("keymgmt:list", expired)
-	if _, ok := c.cacheFind("keymgmt:list"); ok {
+	c.cacheStore([]string{"keymgmt:list"}, expired)
+	if _, ok := c.cacheFind([]string{"keymgmt:list"}); ok {
 		t.Error("an expired token must not be served from the cache")
 	}
 }
