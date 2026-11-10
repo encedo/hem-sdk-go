@@ -129,8 +129,58 @@ func TestCipherWrapCarriesCtx(t *testing.T) {
 	if rec.body["ext_kid"] != "kid1" || rec.body["alg"] != "AES256" {
 		t.Errorf("body = %v", rec.body)
 	}
-	if rec.body["ctx"] != b64("ENC-WG-PSK-v1") {
-		t.Errorf("ctx = %v", rec.body["ctx"])
+	// Firmware 1.3 reads hkdf_ctx; a `ctx` field is ignored by the device and
+	// would leave the key derived without any context.
+	if rec.body["hkdf_ctx"] != b64("ENC-WG-PSK-v1") {
+		t.Errorf("hkdf_ctx = %v", rec.body["hkdf_ctx"])
+	}
+	if _, ok := rec.body["ctx"]; ok {
+		t.Error("ctx must not be sent: the device ignores it")
+	}
+	if _, ok := rec.body["hkdf_salt"]; ok {
+		t.Error("hkdf_salt must be absent when Salt is unset")
+	}
+}
+
+func TestCipherUnwrapCarriesSalt(t *testing.T) {
+	c, rec := serve(t, `{"unwrapped":"`+b64("psk")+`"}`)
+	_, err := c.CipherUnwrap(context.Background(), "tok", "kid1", []byte("w"),
+		CryptoOpts{Alg: "AES256", ExtKID: "kid1", Ctx: []byte("c"), Salt: []byte("s")})
+	if err != nil {
+		t.Fatalf("CipherUnwrap: %v", err)
+	}
+	if rec.body["hkdf_ctx"] != b64("c") || rec.body["hkdf_salt"] != b64("s") {
+		t.Errorf("body = %v", rec.body)
+	}
+}
+
+// Firmware 1.3 answers a wrong MAC with 200 {"verified":false}. Treating any
+// 200 as success, as this SDK once did, accepts every MAC.
+func TestHmacVerifyReadsTheVerdict(t *testing.T) {
+	for _, tc := range []struct {
+		reply string
+		ok    bool
+	}{
+		{`{"verified":true}`, true},
+		{`{"verified":false}`, false},
+		{`{}`, false},
+		{``, false},
+	} {
+		c, rec := serve(t, tc.reply)
+		err := c.HmacVerify(context.Background(), "tok", "kid1", []byte("m"), []byte("mac"),
+			CryptoOpts{Alg: "SHA2-256", ExtKID: "kid1"})
+		if rec.path != "/api/crypto/hmac/verify" {
+			t.Fatalf("path = %s", rec.path)
+		}
+		if tc.ok && err != nil {
+			t.Errorf("reply %q: %v", tc.reply, err)
+		}
+		if !tc.ok {
+			he, isHem := err.(*HemError)
+			if !isHem || he.Code != "not_verified" {
+				t.Errorf("reply %q: err = %v, want not_verified", tc.reply, err)
+			}
+		}
 	}
 }
 

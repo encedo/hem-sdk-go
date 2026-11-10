@@ -44,8 +44,9 @@ const (
 	// maxCryptoMsg is the largest msg the device accepts on /api/crypto/*.
 	maxCryptoMsg = 2048
 
-	// maxCtx is the largest HKDF context the device accepts.
-	maxCtx = 64
+	// maxCtx is the largest HKDF context, and salt, the device accepts
+	// (hkdf_ctx / hkdf_salt, decoded, firmware 1.3).
+	maxCtx = 128
 
 	// tokenSkew keeps a cached token from being handed out moments before the
 	// device would reject it as expired.
@@ -266,7 +267,8 @@ func (c *Client) do(ctx context.Context, method, url string, body interface{}, t
 	}
 
 	// A 2xx with no body is a valid answer for the endpoints that only signal
-	// success (hmac/verify, key update); decoding it would fail on EOF.
+	// success (key update); decoding it would fail on EOF. hmac/verify is not
+	// one of them: its verdict is in the body (see HmacVerify).
 	if out != nil && len(respData) > 0 {
 		dec := json.NewDecoder(bytes.NewReader(respData))
 		dec.UseNumber()
@@ -878,7 +880,8 @@ type CryptoOpts struct {
 	ExtKID string // peer public key already stored in the HEM
 	PubKey []byte // raw peer public key; must not be combined with ExtKID
 	AAD    []byte // cipher encrypt/decrypt, GCM modes only
-	Ctx    []byte // HKDF context, max 64 bytes — cipher and wrap/unwrap
+	Ctx    []byte // HKDF context (hkdf_ctx), max 128 bytes — cipher and wrap/unwrap, modes 1/2
+	Salt   []byte // HKDF salt (hkdf_salt), max 128 bytes — cipher and wrap/unwrap, modes 1/2
 	IV     []byte // explicit IV — cipher decrypt and wrap/unwrap
 	Tag    []byte // GCM authentication tag — cipher decrypt only
 }
@@ -894,6 +897,18 @@ func (o CryptoOpts) applyPeer(body map[string]interface{}) error {
 		body["pubkey"] = base64.StdEncoding.EncodeToString(o.PubKey)
 	}
 	return nil
+}
+
+// applyHKDF writes hkdf_ctx and hkdf_salt into body. Firmware 1.3 reads only
+// these names; the `ctx` field older builds of this SDK sent is ignored by the
+// device, so a key derived "with" it was derived without any context.
+func (o CryptoOpts) applyHKDF(body map[string]interface{}) {
+	if len(o.Ctx) > 0 {
+		body["hkdf_ctx"] = base64.StdEncoding.EncodeToString(o.Ctx)
+	}
+	if len(o.Salt) > 0 {
+		body["hkdf_salt"] = base64.StdEncoding.EncodeToString(o.Salt)
+	}
 }
 
 // reject reports the options set by the caller that the endpoint does not accept.
@@ -916,6 +931,9 @@ func (o CryptoOpts) reject(op string, allowed ...string) error {
 	if len(o.Ctx) > 0 && !ok("ctx") {
 		bad = append(bad, "Ctx")
 	}
+	if len(o.Salt) > 0 && !ok("ctx") {
+		bad = append(bad, "Salt")
+	}
 	if len(o.IV) > 0 && !ok("iv") {
 		bad = append(bad, "IV")
 	}
@@ -931,6 +949,12 @@ func (o CryptoOpts) reject(op string, allowed ...string) error {
 	if len(o.Ctx) > maxCtx {
 		return &HemError{
 			Message: fmt.Sprintf("%s: ctx is %d bytes, max %d", op, len(o.Ctx), maxCtx),
+			Code:    "invalid_arg",
+		}
+	}
+	if len(o.Salt) > maxCtx {
+		return &HemError{
+			Message: fmt.Sprintf("%s: salt is %d bytes, max %d", op, len(o.Salt), maxCtx),
 			Code:    "invalid_arg",
 		}
 	}
@@ -1023,6 +1047,11 @@ func (c *Client) HmacHash(ctx context.Context, token, kid string, msg []byte, op
 // HmacVerify checks a MAC on the device. It returns nil when the MAC is valid
 // and a *HemError otherwise — the comparison happens inside the HEM, so a
 // caller never has to write a constant-time compare of its own.
+//
+// Firmware 1.3 answers a MAC that does not match with 200 and
+// {"verified":false}, not with an HTTP error, so the body is the verdict: a
+// false or a missing `verified` is Code "not_verified". Anything else from the
+// device is an error as before.
 // opts must match the HmacHash call that produced the MAC.
 // Honours: Alg, ExtKID, PubKey. Scope: keymgmt:use:<KID>
 func (c *Client) HmacVerify(ctx context.Context, token, kid string, msg, mac []byte, opts CryptoOpts) error {
@@ -1043,7 +1072,16 @@ func (c *Client) HmacVerify(ctx context.Context, token, kid string, msg, mac []b
 	if opts.Alg != "" {
 		body["alg"] = opts.Alg
 	}
-	return c.req(ctx, "POST", c.baseURL+"/api/crypto/hmac/verify", body, token, nil)
+	var resp struct {
+		Verified *bool `json:"verified"`
+	}
+	if err := c.req(ctx, "POST", c.baseURL+"/api/crypto/hmac/verify", body, token, &resp); err != nil {
+		return err
+	}
+	if resp.Verified == nil || !*resp.Verified {
+		return &HemError{Message: "HEM: the MAC does not verify", Code: "not_verified"}
+	}
+	return nil
 }
 
 // CipherResult holds the output of CipherEncrypt.
@@ -1077,9 +1115,7 @@ func (c *Client) CipherEncrypt(ctx context.Context, token, kid string, plaintext
 	if len(opts.AAD) > 0 {
 		body["aad"] = base64.StdEncoding.EncodeToString(opts.AAD)
 	}
-	if len(opts.Ctx) > 0 {
-		body["ctx"] = base64.StdEncoding.EncodeToString(opts.Ctx)
-	}
+	opts.applyHKDF(body)
 	var resp struct {
 		Ciphertext string `json:"ciphertext"`
 		IV         string `json:"iv"`
@@ -1130,9 +1166,7 @@ func (c *Client) CipherDecrypt(ctx context.Context, token, kid string, ciphertex
 	if len(opts.AAD) > 0 {
 		body["aad"] = base64.StdEncoding.EncodeToString(opts.AAD)
 	}
-	if len(opts.Ctx) > 0 {
-		body["ctx"] = base64.StdEncoding.EncodeToString(opts.Ctx)
-	}
+	opts.applyHKDF(body)
 	var resp struct {
 		Plaintext string `json:"plaintext"`
 	}
@@ -1169,9 +1203,7 @@ func (c *Client) CipherWrap(ctx context.Context, token, kid string, data []byte,
 	if opts.Alg != "" {
 		body["alg"] = opts.Alg
 	}
-	if len(opts.Ctx) > 0 {
-		body["ctx"] = base64.StdEncoding.EncodeToString(opts.Ctx)
-	}
+	opts.applyHKDF(body)
 	if len(opts.IV) > 0 {
 		body["iv"] = base64.StdEncoding.EncodeToString(opts.IV)
 	}
@@ -1211,9 +1243,7 @@ func (c *Client) CipherUnwrap(ctx context.Context, token, kid string, wrapped []
 	if opts.Alg != "" {
 		body["alg"] = opts.Alg
 	}
-	if len(opts.Ctx) > 0 {
-		body["ctx"] = base64.StdEncoding.EncodeToString(opts.Ctx)
-	}
+	opts.applyHKDF(body)
 	if len(opts.IV) > 0 {
 		body["iv"] = base64.StdEncoding.EncodeToString(opts.IV)
 	}
